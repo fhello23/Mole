@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""Check real keyboard input and terminal layout with synthetic apps only."""
+import fcntl
+import os
+import pty
+import re
+import select
+import signal
+import struct
+import subprocess
+import tempfile
+import termios
+import time
+import unicodedata
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+ANSI = re.compile(rb'\x1b\[[0-?]*[ -/]*[@-~]')
+
+
+def plain(frame):
+    return ANSI.sub(b'', frame).decode('utf-8').replace('\r', '')
+
+
+def assert_fits(frame, rows, columns):
+    # The query is drawn once per byte. Inspect the last complete redraw.
+    frame = frame.rsplit(b'\x1b[H', 1)[-1]
+    lines = plain(frame).splitlines()
+    for line in lines:
+        width = sum(0 if unicodedata.combining(c) else
+                    2 if unicodedata.east_asian_width(c) in 'WF' else 1
+                    for c in line)
+        assert width <= columns, (columns, width, line)
+    assert len(lines) < rows, (rows, len(lines), lines)
+
+
+def check_menu(columns):
+    with tempfile.TemporaryDirectory(prefix='mole-uninstall-menu-') as directory:
+        env = dict(os.environ, HOME=directory, PROJECT_ROOT=str(ROOT),
+                   TERM='xterm-256color', COLUMNS=str(columns), LINES='16',
+                   MOLE_TEST_NO_AUTH='1', MOLE_DRY_RUN='1')
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 16, columns, 0, 0))
+
+        def own_terminal():
+            os.setsid()
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+        process = subprocess.Popen(
+            ['/bin/bash', str(ROOT / 'tests/fixtures/uninstall_menu.sh'), '--tty'],
+            stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=own_terminal)
+        os.close(slave)
+
+        def receive(marker):
+            data = b''
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                readable = select.select([master], [], [], .1)[0]
+                if readable:
+                    try:
+                        chunk = os.read(master, 65536)
+                    except OSError:
+                        chunk = b''
+                    data += chunk
+                    if not chunk:
+                        break
+                elif marker in data:
+                    return data
+            assert marker in data, ('missing output', marker, data[-2000:])
+            return data
+
+        try:
+            frame = receive(b'/ Search')
+            assert b'O A-Z' in frame, plain(frame)
+            assert_fits(frame, 16, columns)
+            os.write(master, b'o')
+            frame = receive(b'O Z-A')
+            assert_fits(frame, 16, columns)
+            # Paste as one write: the menu must not drain query characters.
+            os.write(master, b'/vIsUaL studio\r')
+            frame = receive(b'Esc Clear')
+            # Wait for Enter to apply (editing frames also show Esc Clear).
+            if b'Enter Save' not in frame:
+                frame += receive(b'Enter Save')
+            assert '(1/5; 0 selected)' in plain(frame), plain(frame)
+            assert_fits(frame, 16, columns)
+            os.write(master, b' ')
+            receive(b'1 selected')
+            os.write(master, b'\r')
+            result = receive(b'SELECTED=/fixture/Studio.app')
+            assert b'SELECTED=/fixture/Alpha.app' not in result, plain(result)
+            assert process.wait(timeout=3) == 0
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=3)
+            os.close(master)
+
+
+for terminal_width in (40, 60, 80, 120):
+    check_menu(terminal_width)
+print('PASS: A-Z/Z-A, pasted multiword search, exact selection, and layouts at 40/60/80/120 columns')
