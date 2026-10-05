@@ -76,8 +76,14 @@ def check_menu(columns):
             os.write(master, b'o')
             frame = receive(b'O Z-A')
             assert_fits(frame, 16, columns)
+            # An unrecognized sequence (Shift+Up) must not leak bytes into
+            # the query, while a later paste is still kept whole.
+            os.write(master, b'/vIs')
+            receive(b'/ Search: vIs_')
+            os.write(master, b'\x1b[1;2A')
+            time.sleep(.3)
             # Paste as one write: the menu must not drain query characters.
-            os.write(master, b'/vIsUaL studio\r')
+            os.write(master, b'UaL studio\r')
             frame = receive(b'Esc Clear')
             # Wait for Enter to apply (editing frames also show Esc Clear).
             if b'Enter Save' not in frame:

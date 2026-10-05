@@ -900,6 +900,22 @@ EOF
     [ "$status" -eq 0 ]
 }
 
+@test "read_key consumes unrecognized escape sequences whole in both modes" {
+    run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash <<'EOF'
+export MOLE_BASE_LOADED=1
+source "$PROJECT_ROOT/lib/core/ui.sh"
+for mode in 0 1; do
+    export MOLE_READ_KEY_FORCE_CHAR=$mode
+    # Shift+Up, Ctrl+Right, F5, Insert, Shift+Tab: none may leak into typed keys.
+    for sequence in '1;2A' '1;5C' '15~' '2~' 'Z'; do
+        keys=$({ read_key; read_key; } < <(printf '\033[%sx' "$sequence"))
+        [[ "$keys" == $'OTHER\nCHAR:x' ]] || { echo "mode=$mode seq=$sequence got=$keys"; exit 1; }
+    done
+done
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
 @test "read_key respects MOLE_READ_KEY_FORCE_CHAR" {
     run /bin/bash -c "export MOLE_BASE_LOADED=1; export MOLE_READ_KEY_FORCE_CHAR=1; source '$PROJECT_ROOT/lib/core/ui.sh'; echo -n 'j' | read_key"
     [ "$output" = "CHAR:j" ]

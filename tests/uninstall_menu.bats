@@ -73,9 +73,29 @@ run_selector() {
 }
 
 @test "uninstall cannot submit hidden selections from an empty search result" {
-    run_selector CHAR:s SPACE CHAR:/ CHAR:~ ENTER ENTER QUIT ENTER
+    run_selector CHAR:s SPACE CHAR:/ CHAR:~ ENTER ENTER ENTER
     [[ "$output" == *"SELECTED=/fixture/Alpha.app"* ]] || return 1
-    [[ "$output" == *"KEYS=8"* ]] || return 1
+    [[ "$output" == *"KEYS=7"* ]] || return 1
+}
+
+@test "uninstall Enter clears a search that hides selections instead of submitting" {
+    # Alpha is selected, then hidden by a search that still shows Studio.
+    run_selector CHAR:s SPACE CHAR:/ CHAR:v CHAR:i CHAR:s ENTER ENTER ENTER
+    [[ "$output" == *"KEYS=9"* ]] || return 1
+    [[ "$output" == *"SELECTED=/fixture/Alpha.app"* ]] || return 1
+    [[ "$output" != *"SELECTED=/fixture/Studio.app"* ]] || return 1
+}
+
+@test "uninstall footer does not offer Q Cancel while a search is applied" {
+    run_selector CHAR:/ CHAR:v CHAR:i CHAR:s ENTER
+    run cat "$MENU_OUTPUT"
+    # Q clears an applied search, so its frame must not label Q as Cancel.
+    # Typing frames draw "vis_"; only the applied frame has a color reset here.
+    local applied="${output##*Search: vis$'\033'}"
+    [[ "$applied" != "$output" ]] || return 1
+    applied="${applied%%$'\033[H'*}"
+    [[ "$applied" == *"Esc Clear"* ]] || return 1
+    [[ "$applied" != *"Q Cancel"* ]] || return 1
 }
 
 @test "uninstall footer keeps name order and search discoverable on narrow terminals" {

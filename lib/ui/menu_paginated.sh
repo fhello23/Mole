@@ -607,10 +607,12 @@ paginated_multi_select() {
             local term_width="${COLUMNS:-}"
             [[ -z "$term_width" ]] && term_width=$(tput cols 2> /dev/null || echo 80)
             [[ "$term_width" =~ ^[0-9]+$ ]] || term_width=80
-            local -a _segs=("$space_select" "$enter" "$cancel_label")
+            local -a _segs=("$space_select" "$enter")
             if [[ $term_width -ge 60 ]]; then
-                _segs=("$nav" "$space_select" "$enter" "$cancel_label")
+                _segs=("$nav" "$space_select" "$enter")
             fi
+            # Q clears an applied search like Esc, so it only cancels without one.
+            [[ -z "$filter_text" ]] && _segs+=("$cancel_label")
             _print_wrapped_controls "$sep" "${_segs[@]}"
             local -a _segs_browse=("$filter_ctrl")
             if [[ "$has_sort_controls" == true ]]; then
@@ -953,7 +955,30 @@ paginated_multi_select() {
                     need_full_redraw=true
                     continue
                 fi
-                # An empty search result must not submit hidden selections.
+                # Enter must not submit selections the search hides. Clear the
+                # search instead so every selection is on screen before saving.
+                if [[ -n "$filter_text" && $selected_count -gt 0 ]]; then
+                    local -a _in_view=()
+                    local _v _hidden=false
+                    for _v in ${view_indices[@]+"${view_indices[@]}"}; do
+                        _in_view[_v]=1
+                    done
+                    for ((i = 0; i < total_items; i++)); do
+                        if [[ ${selected[i]} == true && -z "${_in_view[i]:-}" ]]; then
+                            _hidden=true
+                            break
+                        fi
+                    done
+                    if [[ "$_hidden" == true ]]; then
+                        filter_text=""
+                        filter_text_lower=""
+                        rebuild_view
+                        cursor_pos=0
+                        top_index=0
+                        need_full_redraw=true
+                        continue
+                    fi
+                fi
                 [[ ${#view_indices[@]} -eq 0 ]] && continue
                 # Smart Enter behavior
                 # 1. Check if any items are already selected
