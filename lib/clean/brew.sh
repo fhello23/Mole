@@ -297,15 +297,16 @@ clean_homebrew() {
                     echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Homebrew · would cleanup"
                     note_activity
                 fi
-            fi
-            local dry_run_autoremove_file
-            dry_run_autoremove_file=$(create_temp_file)
-            local dry_run_autoremove_exit=0
-            run_brew_autoremove_preview "$autoremove_preview_timeout" "$dry_run_autoremove_file" || dry_run_autoremove_exit=$?
-            if [[ $dry_run_autoremove_exit -eq 0 ]] && brew_autoremove_preview_has_items "$dry_run_autoremove_file"; then
-                show_brew_autoremove_preview "$dry_run_autoremove_file"
-            elif mole_rc_timeout "$dry_run_autoremove_exit"; then
-                echo -e "  ${GRAY}${ICON_WARNING}${NC} Autoremove preview timed out · run ${GRAY}brew autoremove --dry-run${NC} manually"
+                # Autoremove sits after the window check in the real run too.
+                local dry_run_autoremove_file
+                dry_run_autoremove_file=$(create_temp_file)
+                local dry_run_autoremove_exit=0
+                run_brew_autoremove_preview "$autoremove_preview_timeout" "$dry_run_autoremove_file" || dry_run_autoremove_exit=$?
+                if [[ $dry_run_autoremove_exit -eq 0 ]] && brew_autoremove_preview_has_items "$dry_run_autoremove_file"; then
+                    show_brew_autoremove_preview "$dry_run_autoremove_file"
+                elif mole_rc_timeout "$dry_run_autoremove_exit"; then
+                    echo -e "  ${GRAY}${ICON_WARNING}${NC} Autoremove preview timed out · run ${GRAY}brew autoremove --dry-run${NC} manually"
+                fi
             fi
         fi
         return 0
@@ -332,6 +333,12 @@ clean_homebrew() {
         run_with_timeout "$cleanup_timeout" brew cleanup --prune=30 > "$brew_tmp_file" 2>&1 || brew_exit=$?
     if [[ -t 1 ]]; then stop_inline_spinner; fi
     restore_homebrew_active_links
+    if mole_rc_signal "$brew_exit"; then
+        # Ctrl-C while brew holds the terminal reaches only the child.
+        debug_log "Homebrew cleanup: owner command interrupted (exit $brew_exit)"
+        _mole_record_clean_cancellation "$brew_exit" "Homebrew cleanup"
+        return "$brew_exit"
+    fi
 
     local brew_success=false
     if [[ $brew_exit -eq 0 ]]; then

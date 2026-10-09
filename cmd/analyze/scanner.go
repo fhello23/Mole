@@ -1078,6 +1078,7 @@ func getDirectorySizeFromDuWithExcludeAndIgnores(ctx context.Context, path strin
 		return totalSize - excludeSize, nil
 	}
 
+	// Library needs one traversal so cross-directory hardlinks count once.
 	return runDuSize(path)
 }
 

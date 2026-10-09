@@ -47,22 +47,28 @@ xcode_build_tooling_process_state() {
     return 1
 }
 
-# Centralized check for critical system components (case-insensitive)
+# Centralized check for critical system components (case-insensitive).
+# nocasematch instead of a lowercasing tr: clean asks this once per
+# candidate, so a subprocess here cost seconds per run.
 is_critical_system_component() {
     local token="$1"
     [[ -z "$token" ]] && return 1
 
-    local lower
-    lower=$(echo "$token" | LC_ALL=C tr '[:upper:]' '[:lower:]')
-
-    case "$lower" in
+    local restore_nocasematch=false
+    if ! shopt -q nocasematch; then
+        shopt -s nocasematch
+        restore_nocasematch=true
+    fi
+    local critical=1
+    case "$token" in
         *backgroundtaskmanagement* | *loginitems* | *systempreferences* | *systemsettings* | *settings* | *preferences* | *controlcenter* | *biometrickit* | *sfl* | *tcc*)
-            return 0
-            ;;
-        *)
-            return 1
+            critical=0
             ;;
     esac
+    if [[ "$restore_nocasematch" == "true" ]]; then
+        shopt -u nocasematch
+    fi
+    return "$critical"
 }
 
 # Check if bundle ID matches pattern (glob support)
@@ -225,7 +231,8 @@ should_protect_data() {
         com.tencent.* | com.sogou.* | com.baidu.* | com.googlecode.* | im.rime.*)
             # These might have wildcards, check detailed list
             for pattern in "${DATA_PROTECTED_BUNDLES[@]}"; do
-                if bundle_matches_pattern "$bundle_id" "$pattern"; then
+                # shellcheck disable=SC2053 # unquoted RHS is the glob, as in bundle_matches_pattern
+                if [[ -n "$pattern" && "$bundle_id" == $pattern ]]; then
                     return 0
                 fi
             done
@@ -235,7 +242,8 @@ should_protect_data() {
 
     # Fallback: check against the full DATA_PROTECTED_BUNDLES list
     for pattern in "${DATA_PROTECTED_BUNDLES[@]}"; do
-        if bundle_matches_pattern "$bundle_id" "$pattern"; then
+        # shellcheck disable=SC2053 # unquoted RHS is the glob, as in bundle_matches_pattern
+        if [[ -n "$pattern" && "$bundle_id" == $pattern ]]; then
             return 0
         fi
     done
@@ -357,6 +365,19 @@ _mole_is_shared_home_state_root() {
 should_protect_path() {
     local path="$1"
     [[ -z "$path" ]] && return 1
+
+    # Local database state and recovery copies are not rebuildable caches.
+    # Explicit uninstall retains its separate reviewed-data policy.
+    if [[ "${MOLE_UNINSTALL_MODE:-0}" != "1" ]]; then
+        case "$path" in
+            "$HOME/.prometheus/data" | "$HOME/.prometheus/data/"* | \
+                "$HOME/.gitconfig.lock" | "$HOME/.gitconfig.bak"* | \
+                "$HOME/.config/fish/fish_history.bak"* | \
+                "$HOME/.bash_history.bak"* | "$HOME/.zsh_history.bak"*)
+                return 0
+                ;;
+        esac
+    fi
 
     if _mole_is_shared_home_state_root "$path"; then
         return 0
@@ -575,20 +596,23 @@ should_protect_path() {
         if [[ "${MOLE_UNINSTALL_MODE:-0}" == "1" ]]; then
             # Uninstall mode: first check if it's an uninstallable Apple app
             for pattern in "${APPLE_UNINSTALLABLE_APPS[@]}"; do
-                if bundle_matches_pattern "$path" "$pattern"; then
+                # shellcheck disable=SC2053 # unquoted RHS is the glob, as in bundle_matches_pattern
+                if [[ -n "$pattern" && "$path" == $pattern ]]; then
                     return 1 # Can be uninstalled
                 fi
             done
             # Then check system-critical components
             for pattern in "${SYSTEM_CRITICAL_BUNDLES[@]}"; do
-                if bundle_matches_pattern "$path" "$pattern"; then
+                # shellcheck disable=SC2053 # unquoted RHS is the glob, as in bundle_matches_pattern
+                if [[ -n "$pattern" && "$path" == $pattern ]]; then
                     return 0
                 fi
             done
         else
             # Normal mode (cleanup): protect both system-critical and data-protected bundles
             for pattern in "${SYSTEM_CRITICAL_BUNDLES[@]}" "${DATA_PROTECTED_BUNDLES[@]}"; do
-                if bundle_matches_pattern "$path" "$pattern"; then
+                # shellcheck disable=SC2053 # unquoted RHS is the glob, as in bundle_matches_pattern
+                if [[ -n "$pattern" && "$path" == $pattern ]]; then
                     return 0
                 fi
             done

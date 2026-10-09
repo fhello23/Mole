@@ -39,8 +39,9 @@ fi
 
 # Existing writable logs need no mkdir/touch before each synchronous append.
 # Missing files and privileged ownership repair retain the original setup path.
+# EUID avoids forking id(1) once per log line.
 _mole_prepare_log_append() {
-    if [[ -f "$1" && -w "$1" ]] && ! is_root_user; then
+    if [[ -f "$1" && -w "$1" && ${EUID:-0} -ne 0 ]]; then
         return 0
     fi
     ensure_user_file "$1"
@@ -50,6 +51,9 @@ append_log_line() {
     local file_path="$1"
     local line="${2:-}"
 
+    if [[ "$file_path" == "$OPERATIONS_LOG_FILE" ]]; then
+        _mole_escape_log_value line "$line"
+    fi
     _mole_prepare_log_append "$file_path"
     printf '%s\n' "$line" >> "$file_path" 2> /dev/null || true
 }
@@ -59,7 +63,17 @@ append_log_lines() {
     shift
 
     _mole_prepare_log_append "$file_path"
-    printf '%s\n' "$@" >> "$file_path" 2> /dev/null || true
+    if [[ "$file_path" == "$OPERATIONS_LOG_FILE" ]]; then
+        local record
+        local -a operation_records=()
+        for record in "$@"; do
+            _mole_escape_log_value record "$record"
+            operation_records+=("$record")
+        done
+        printf '%s\n' "${operation_records[@]+"${operation_records[@]}"}" >> "$file_path" 2> /dev/null || true
+    else
+        printf '%s\n' "$@" >> "$file_path" 2> /dev/null || true
+    fi
 }
 
 # Rotate log file if it exceeds maximum size
@@ -149,6 +163,17 @@ log_warning() {
     fi
 }
 
+# Record a warning in mole.log without printing it, for diagnostics the
+# terminal deliberately stays quiet about, such as a skipped owner timeout.
+log_warning_to_file() {
+    local timestamp
+    timestamp=$(get_timestamp)
+    append_log_line "$LOG_FILE" "[$timestamp] WARNING: $1"
+    if [[ "${MO_DEBUG:-}" == "1" ]]; then
+        append_log_line "$DEBUG_LOG_FILE" "[$timestamp] WARNING: $1"
+    fi
+}
+
 # shellcheck disable=SC2329
 log_error() {
     echo -e "${YELLOW}${ICON_ERROR}${NC} $1" >&2
@@ -215,6 +240,23 @@ oplog_enabled() {
     [[ "${MO_NO_OPLOG:-}" != "1" ]]
 }
 
+# Session ownership is exported by the invoking shell. Workers that source
+# common.sh inherit it; a new session always replaces it, including in a
+# child shell. Marker-less commands retain their existing log format.
+_MOLE_OPLOG_RUN_ID="${_MOLE_OPLOG_RUN_ID:-}"
+_MOLE_OPLOG_RUN_COMMAND="${_MOLE_OPLOG_RUN_COMMAND:-}"
+
+# Write the command field into the caller's variable without a per-record
+# subshell. Session markers and batched operations share this same format.
+operation_log_command() {
+    local _mole_log_output="$1" _mole_log_command="$2"
+    if [[ "$_mole_log_command" == "$_MOLE_OPLOG_RUN_COMMAND" && -n "$_MOLE_OPLOG_RUN_ID" ]]; then
+        printf -v "$_mole_log_output" '%s run=%s' "$_mole_log_command" "$_MOLE_OPLOG_RUN_ID"
+    else
+        printf -v "$_mole_log_output" '%s' "$_mole_log_command"
+    fi
+}
+
 # Log an operation to the operations log file
 # Usage: log_operation <command> <action> <path> [detail]
 # Example: log_operation "clean" "REMOVED" "/path/to/file" "15.2MB"
@@ -235,7 +277,9 @@ log_operation() {
     local timestamp
     timestamp=$(get_timestamp)
 
-    local log_line="[$timestamp] [$command] $action $path"
+    local log_command
+    operation_log_command log_command "$command"
+    local log_line="[$timestamp] [$log_command] $action $path"
     [[ -n "$detail" ]] && log_line+=" ($detail)"
 
     append_log_line "$OPERATIONS_LOG_FILE" "$log_line"
@@ -244,23 +288,35 @@ log_operation() {
 # Log session start marker
 # Usage: log_operation_session_start <command>
 log_operation_session_start() {
+    export _MOLE_OPLOG_RUN_ID="" _MOLE_OPLOG_RUN_COMMAND=""
     oplog_enabled || return 0
 
     local command="${1:-mole}"
     local timestamp
     timestamp=$(get_timestamp)
+    # Timestamp, shell pid and native random values avoid a new dependency or
+    # scratch file. The identity remains opaque to readers.
+    export _MOLE_OPLOG_RUN_ID="${timestamp//[!0-9]/}-$$-$RANDOM-$RANDOM"
+    export _MOLE_OPLOG_RUN_COMMAND="$command"
+    local log_command
+    operation_log_command log_command "$command"
 
     append_log_lines \
         "$OPERATIONS_LOG_FILE" \
         "" \
-        "# ========== $command session started at $timestamp =========="
+        "# ========== $log_command session started at $timestamp =========="
 }
 
 # shellcheck disable=SC2329
 log_operation_session_end() {
+    local command="${1:-mole}" log_command
+    operation_log_command log_command "$command"
+    # Ownership ends even when the optional end marker is disabled or fails.
+    if [[ "$command" == "$_MOLE_OPLOG_RUN_COMMAND" ]]; then
+        export _MOLE_OPLOG_RUN_ID="" _MOLE_OPLOG_RUN_COMMAND=""
+    fi
     oplog_enabled || return 0
 
-    local command="${1:-mole}"
     local items="${2:-0}"
     local size="${3:-0}"
     local timestamp
@@ -275,7 +331,7 @@ log_operation_session_end() {
 
     append_log_line \
         "$OPERATIONS_LOG_FILE" \
-        "# ========== $command session ended at $timestamp, $items items, $size_human =========="
+        "# ========== $log_command session ended at $timestamp, $items items, $size_human =========="
 }
 
 # Enhanced debug logging for operations

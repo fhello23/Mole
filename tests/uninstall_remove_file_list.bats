@@ -37,6 +37,8 @@ export MOLE_DELETE_MODE=trash
 export HOME="$HOME"
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
 EOF
 }
 
@@ -76,6 +78,8 @@ PLIST
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
 app="$HOME/Applications/Target.app"
 agents="$HOME/Library/LaunchAgents"
 plan=$(find_app_files com.example.Target Target "$app")
@@ -114,6 +118,8 @@ PLIST
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
 app="$HOME/Applications/Target.app"
 agent="$HOME/Library/LaunchAgents/com.example.Target.helper.plist"
 mv "$app" "$HOME/moved-Target.app"
@@ -148,6 +154,8 @@ PLIST
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
 app="$HOME/Applications/Target.app"
 agent="$HOME/Library/LaunchAgents/com.example.Target.helper.plist"
 plan=$(find_app_files com.example.Target Target "$app")
@@ -155,8 +163,9 @@ plan=$(find_app_files com.example.Target Target "$app")
 mv "$app" "$HOME/moved-Target.app"
 mkdir -p "$app/Contents/MacOS"
 touch "$app/Contents/MacOS/Target"
-count=$(remove_file_list "$plan" false com.example.Target "$app")
-[[ "$count" == 0 ]] || exit 1
+rc=0
+count=$(remove_file_list "$plan" false com.example.Target "$app") || rc=$?
+[[ $rc -eq 16 && "$count" == 0 ]] || exit 1
 [[ -f "$agent" ]] || exit 1
 EOF
 
@@ -180,6 +189,8 @@ PLIST
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
 app="$HOME/Applications/Target.app"
 agent="$HOME/Library/LaunchAgents/com.example.Target.helper.plist"
 mv "$app" "$HOME/moved-Target.app"
@@ -213,6 +224,8 @@ PLIST
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
 app="$HOME/Applications/Target.app"
 agent="$HOME/Library/LaunchAgents/com.example.Target.helper.plist"
 mv "$app" "$HOME/moved-Target.app"
@@ -246,6 +259,8 @@ PLIST
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
 app="$HOME/Applications/Target.app"
 agent="$HOME/Library/LaunchAgents/com.example.Target.helper.plist"
 mv "$app" "$HOME/moved-Target.app"
@@ -280,6 +295,8 @@ PLIST
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
 app="$HOME/Applications/Target.app"
 agent="$HOME/Library/LaunchAgents/com.example.Target.helper.plist"
 mv "$app" "$HOME/moved-Target.app"
@@ -323,6 +340,8 @@ PLIST
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
 app="$HOME/Applications/Target.app"
 agent="$HOME/Library/LaunchAgents/com.example.Target.helper.plist"
 mv "$app" "$HOME/moved-Target.app"
@@ -357,6 +376,8 @@ PLIST
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
 app="$HOME/Applications/Target.app"
 agent="$HOME/Library/LaunchAgents/com.example.Target.helper.plist"
 mv "$app" "$HOME/moved-Target.app"
@@ -475,6 +496,8 @@ ps() {
 }
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
 remove_file_list "$(printf '%s\n%s\n' \
 	"$HOME/Library/Caches/com.example.One" \
 	"$HOME/Library/Caches/com.example.Two")" false
@@ -691,6 +714,8 @@ EOF
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
 export MOLE_UNINSTALL_MODE=1
 protected="$HOME/Library/Logs/com.openai.codex"
 active="$HOME/Library/Caches/com.example.Active"
@@ -716,6 +741,8 @@ SCRIPT
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
 export MOLE_UNINSTALL_MODE=1
 active="$HOME/Library/Caches/com.example.Active"
 mkdir -p "$active"
@@ -743,6 +770,8 @@ SCRIPT
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
 unset MOLE_TEST_TRASH_DIR MOLE_TEST_NO_AUTH
 export MOLE_UNINSTALL_MODE=1
 victim="$HOME/Library/Group Containers/com.example.Privacy"
@@ -775,6 +804,8 @@ SCRIPT
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
 export MOLE_CURRENT_COMMAND=uninstall
 first="$HOME/first"
 second="$HOME/second"
@@ -800,4 +831,37 @@ EOF
         [ "$status" -eq 0 ] || { echo "probe=$probe_rc: $output"; failures=$((failures + 1)); }
     done
     [ "$failures" -eq 0 ]
+}
+
+@test "remove_file_list keeps leftovers when the app returns, whatever the plan's bundle id" {
+    # The replacement test needs no inventory, so a plan narrowed to an
+    # unknown id, or an id that is not reverse-DNS, must keep name-keyed data
+    # exactly like an ordinary plan does.
+    local id
+    for id in unknown com.example.Target_Beta com.example.Target; do
+        rm -rf "$HOME/Applications" "$HOME/Library" "$HOME/moved-Target.app"
+        mkdir -p "$HOME/Applications/Target.app/Contents" "$HOME/Library/Application Support/Target"
+        printf 'notes\n' > "$HOME/Library/Application Support/Target/notes"
+        run env PROJECT_ROOT="$PROJECT_ROOT" BUNDLE_ID="$id" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
+app="$HOME/Applications/Target.app"
+data="$HOME/Library/Application Support/Target"
+mv "$app" "$HOME/moved-Target.app"
+mkdir -p "$app/Contents"
+rc=0
+count=$(remove_file_list "$data" false "$BUNDLE_ID" "$app") || rc=$?
+[[ $rc -eq 16 && "$count" == 0 ]] || { echo "reappeared rc=$rc count=$count"; exit 1; }
+[[ -f "$data/notes" ]] || { echo "data removed while the app path was occupied"; exit 1; }
+# Positive control: with the path free, the same call reaches the sink.
+rm -rf "$app"
+rc=0
+count=$(remove_file_list "$data" false "$BUNDLE_ID" "$app") || rc=$?
+[[ $rc -eq 0 && "$count" == 1 && ! -e "$data" ]] || { echo "control rc=$rc count=$count"; exit 1; }
+EOF
+        [ "$status" -eq 0 ] || { echo "bundle id $id: $output"; return 1; }
+    done
 }

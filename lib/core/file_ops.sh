@@ -39,6 +39,9 @@ if [[ -z "${MOLE_TIMEOUTS_LOADED:-}" ]]; then
     source "$_MOLE_CORE_DIR/timeouts.sh"
 fi
 
+# shellcheck source=lib/core/browser_clones.sh
+source "$_MOLE_CORE_DIR/browser_clones.sh"
+
 # Keep the removal-timeout summary actionable: record which path ran out of
 # budget so the closing note can name it instead of a bare count.
 _mole_record_removal_timeout_path() {
@@ -1359,6 +1362,11 @@ _record_file_ops_dry_run_target() {
     local eligibility_still_current=true
     if [[ -n "$precomputed_size_kb" && "$precomputed_size_kb" =~ ^[0-9]+$ ]]; then
         size_kb="$precomputed_size_kb"
+    elif [[ "$precomputed_size_kb" == "unknown" ]]; then
+        # The caller cannot infer reclaimable bytes from allocated blocks
+        # (for example APFS code-signature clones). Keep the preview partial.
+        size_known=false
+        eligibility_still_current=false
     else
         eligibility_still_current=false
         local measured_size=""
@@ -1404,16 +1412,30 @@ _record_file_ops_dry_run_target() {
 # Preserve the first timeout or signal observed by a clean deletion sink. Some
 # older cleanup families intentionally treat ordinary item failures as
 # best-effort; this sticky status prevents those `|| true` paths from turning a
-# user interrupt into permission to continue deleting later targets.
+# user interrupt into permission to continue deleting later targets. An
+# optional label names what was running; see _mole_note_clean_cancel_source.
 _mole_record_clean_cancellation() {
     local status="$1"
+    local source="${2:-}"
     if [[ "${MOLE_CURRENT_COMMAND:-}" == "clean" ]] && mole_rc_timeout_or_signal "$status"; then
         local existing="${MOLE_CLEAN_CANCEL_STATUS:-0}"
         if ! mole_rc_timeout_or_signal "$existing"; then
             MOLE_CLEAN_CANCEL_STATUS=$status
             export MOLE_CLEAN_CANCEL_STATUS
         fi
+        _mole_note_clean_cancel_source "$source"
     fi
+}
+
+# Name what a clean cancellation came from, so the summary and mole.log can say
+# what timed out instead of only the exit status. A cancellation unwinds from
+# the innermost caller outward, so the first label wins and the step runners
+# only fill the gap when nothing deeper knew a better name.
+_mole_note_clean_cancel_source() {
+    local source="${1:-}"
+    [[ -n "$source" && -z "${MOLE_CLEAN_CANCEL_SOURCE:-}" ]] || return 0
+    MOLE_CLEAN_CANCEL_SOURCE="$source"
+    export MOLE_CLEAN_CANCEL_SOURCE
 }
 
 # Safe wrapper around rm -rf with validation
@@ -1515,13 +1537,19 @@ safe_remove() {
 
             if [[ -e "$path" ]]; then
                 local size_kb=0
-                local size_rc=0
-                size_kb=$(get_path_size_kb "$path" 2> /dev/null) || size_rc=$?
-                if mole_rc_timeout_or_signal "$size_rc"; then
-                    _mole_record_clean_cancellation "$size_rc"
-                    return "$size_rc"
+                if [[ -n "$precomputed_size_kb" ]]; then
+                    if [[ "$precomputed_size_kb" =~ ^[0-9]+$ ]]; then
+                        size_kb="$precomputed_size_kb"
+                    fi
+                else
+                    local size_rc=0
+                    size_kb=$(get_path_size_kb "$path" 2> /dev/null) || size_rc=$?
+                    if mole_rc_timeout_or_signal "$size_rc"; then
+                        _mole_record_clean_cancellation "$size_rc"
+                        return "$size_rc"
+                    fi
+                    [[ $size_rc -eq 0 ]] || size_kb=0
                 fi
-                [[ $size_rc -eq 0 ]] || size_kb=0
                 if [[ "$size_kb" -gt 0 ]]; then
                     file_size=$(bytes_to_human "$((size_kb * 1024))")
                 fi
@@ -1992,7 +2020,7 @@ safe_sudo_remove() {
     if _mole_privileged_path_has_mutable_ancestor "$path"; then
         if [[ ${EUID:-0} -ne 0 ]]; then
             debug_log "Downgrading sudo remove below mutable parent: $path"
-            safe_remove "$path" true "" "$deadline_seconds" \
+            safe_remove "$path" true "$precomputed_size_kb" "$deadline_seconds" \
                 "$expected_parent" "$expected_parent_id" "$expected_target_id" \
                 "$expected_file_sha256" "$expected_absent_path"
             return $?
@@ -2288,14 +2316,19 @@ _mole_report_unverified_delete() {
     local mode="$2"
     local size_kb="$3"
     local reason="${4:-$MOLE_ERR_OWNER_UNVERIFIED}"
+    local refusal_reason="ownership-unverified"
+    local detail="agent ownership unverified"
+    local explanation="the agent file changed or could not be inspected. Review the plist before retrying."
     if [[ $reason -eq $MOLE_ERR_APP_REAPPEARED ]]; then
-        _mole_delete_log "$mode" "$size_kb" "app-reappeared" "$path"
-        log_operation "${MOLE_CURRENT_COMMAND:-uninstall}" "SKIPPED" "$path" "selected app path reappeared"
-        printf 'Kept %s: the selected app path exists again. Select the app and review its removal plan.\n' "$path" >&2
-    else
-        _mole_delete_log "$mode" "$size_kb" "ownership-unverified" "$path"
-        log_operation "${MOLE_CURRENT_COMMAND:-uninstall}" "SKIPPED" "$path" "agent ownership unverified"
-        printf 'Kept %s: the agent file changed or could not be inspected. Review the plist before retrying.\n' "$path" >&2
+        refusal_reason="app-reappeared"
+        detail="selected app path reappeared"
+        explanation="the selected app path exists again. Select the app and review its removal plan."
+    fi
+    _mole_delete_log "$mode" "$size_kb" "$refusal_reason" "$path"
+    log_operation "${MOLE_CURRENT_COMMAND:-uninstall}" "SKIPPED" "$path" "$detail"
+    _mole_record_uninstall_refusal "$path" "$refusal_reason"
+    if [[ "${_MOLE_UNINSTALL_REFUSALS_ACTIVE:-0}" != 1 ]]; then
+        printf 'Kept %s: %s\n' "$path" "$explanation" >&2
     fi
 }
 
@@ -2315,6 +2348,8 @@ _mole_report_unverified_delete() {
 #
 # Returns 0 on success and a nonzero MOLE_ERR_* code on failure. Always appends a tab-separated line to
 # the deletions log: <iso_ts>\t<mode>\t<size_kb>\t<status>\t<path>.
+# Control bytes in any field are written as \n, \r, \t or \xHH so a name cannot
+# start a record; backslashes stay literal.
 # size_kb is "unknown" when du could not measure the path (permission denied,
 # disappeared mid-call); never silently coerced to 0KB so post-hoc forensics
 # can tell measured-zero from measurement-failure.
@@ -3327,6 +3362,10 @@ _mole_delete_log() {
     local ts
     ts=$(date '+%Y-%m-%dT%H:%M:%S%z' 2> /dev/null || echo "unknown")
 
+    _mole_escape_log_value mode "$mode"
+    _mole_escape_log_value size_kb "$size_kb"
+    _mole_escape_log_value status "$status"
+    _mole_escape_log_value target "$target"
     if ! printf '%s\t%s\t%s\t%s\t%s\n' \
         "$ts" "$mode" "$size_kb" "$status" "$target" \
         >> "$log_file" 2> /dev/null; then
@@ -3838,8 +3877,10 @@ safe_sudo_find_delete() {
                     ' sh "$STAT_BSD" "$age_days" > "$batch_result_file" 2> /dev/null || batch_rc=$?
 
             local batch_ts=""
+            local batch_command=""
             if oplog_enabled; then
                 batch_ts=$(get_timestamp)
+                operation_log_command batch_command "${MOLE_CURRENT_COMMAND:-clean}"
             fi
             local batch_ack_count=0
             local -a removed_lines=()
@@ -3847,7 +3888,7 @@ safe_sudo_find_delete() {
             while IFS= read -r -d '' batch_file; do
                 batch_ack_count=$((batch_ack_count + 1))
                 if [[ -n "$batch_ts" ]]; then
-                    removed_lines+=("[$batch_ts] [${MOLE_CURRENT_COMMAND:-clean}] REMOVED $batch_file (batch)")
+                    removed_lines+=("[$batch_ts] [$batch_command] REMOVED $batch_file (batch)")
                 fi
             done < "$batch_result_file"
             rm -f -- "$batch_result_file" 2> /dev/null || true # SAFE: exact tracked temp file created above

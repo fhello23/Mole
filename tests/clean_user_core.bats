@@ -164,7 +164,7 @@ source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/user.sh"
 start_section_spinner() { :; }
 stop_section_spinner() { :; }
-safe_clean() { echo "SAFE:$2"; }
+safe_clean() { echo "SAFE:${!#}"; }
 clean_trash() { echo "TRASH"; }
 _clean_recent_items() { :; }
 _clean_mail_downloads() { :; }
@@ -202,7 +202,7 @@ EOF
         "$test_home/Library/Caches/deno/origin-data" \
         "$test_home/Library/Caches/ordinary-app/junk"
 
-    run env HOME="$test_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+    run env -u DENO_DIR HOME="$test_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/user.sh"
@@ -343,7 +343,7 @@ clean_user_essentials
 EOF
     [ "$status" -eq 0 ] || { echo "$output"; return 1; }
 
-    run env HOME="$linked_home" PROJECT_ROOT="$PROJECT_ROOT" \
+    run env -u DENO_DIR HOME="$linked_home" PROJECT_ROOT="$PROJECT_ROOT" \
         /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
@@ -447,7 +447,7 @@ EOF
     printf 'app\n' > "$test_home/Library/Caches/ordinary-app/a.txt"
     ln -s "$test_home/Library/Caches/deno-old" "$test_home/Library/Caches/deno"
 
-    run env HOME="$test_home" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 \
+    run env -u DENO_DIR HOME="$test_home" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 \
         /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/bin/clean.sh"
@@ -487,6 +487,171 @@ EOF
         return 1
     }
     rm -rf "$test_home"
+}
+
+@test "clean_user_essentials keeps the DiagnosticReports directory (#1689)" {
+    local test_home="$HOME/diag-home"
+    mkdir -p "$test_home/Library/Logs/DiagnosticReports"
+    touch "$test_home/Library/Logs/DiagnosticReports/App.ips"
+
+    run env HOME="$test_home" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+DRY_RUN=false
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+clean_trash() { :; }
+_clean_recent_items() { :; }
+_clean_mail_downloads() { :; }
+clean_user_essentials
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ -d "$test_home/Library/Logs/DiagnosticReports" ]] || return 1
+    [[ ! -e "$test_home/Library/Logs/DiagnosticReports/App.ips" ]] || return 1
+    rm -rf "$test_home"
+}
+
+@test "user logs retain authored files behind symlinked log roots" {
+    local variant
+    for variant in reports logs library; do
+        local test_home="$BATS_TEST_TMPDIR/log-links-$variant"
+        mkdir -p "$test_home/Library/Logs/DiagnosticReports" "$test_home/authored/Logs/DiagnosticReports"
+        printf 'keep' > "$test_home/authored/report.txt"
+        printf 'keep' > "$test_home/authored/Logs/report.txt"
+        case "$variant" in
+            reports) rmdir "$test_home/Library/Logs/DiagnosticReports"; ln -s "$test_home/authored" "$test_home/Library/Logs/DiagnosticReports" ;;
+            logs) mv "$test_home/Library/Logs" "$test_home/original"; ln -s "$test_home/authored" "$test_home/Library/Logs" ;;
+            library) mv "$test_home/Library" "$test_home/original"; ln -s "$test_home/authored" "$test_home/Library" ;;
+        esac
+        run env HOME="$test_home" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+DRY_RUN=false
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+clean_trash() { :; }
+_clean_recent_items() { :; }
+_clean_mail_downloads() { :; }
+clean_user_essentials
+[[ -f "$HOME/authored/report.txt" && -f "$HOME/authored/Logs/report.txt" ]] || exit 1
+EOF
+        [ "$status" -eq 0 ] || { echo "$variant: $output"; return 1; }
+    done
+}
+
+@test "user logs recheck the DiagnosticReports root after sizing and at the final sink" {
+    local phase
+    for phase in sizing sink preview replacement; do
+        local test_home="$BATS_TEST_TMPDIR/log-race-$phase"
+        mkdir -p "$test_home/Library/Logs/DiagnosticReports" "$test_home/authored"
+        printf 'old' > "$test_home/Library/Logs/DiagnosticReports/report.txt"
+        printf 'keep' > "$test_home/authored/report.txt"
+        run env HOME="$test_home" PHASE="$phase" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+DRY_RUN=false
+[[ "$PHASE" != preview ]] || DRY_RUN=true
+record_dry_run_cleanup_target() { touch "$HOME/unsafe-preview"; }
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+clean_trash() { :; }
+_clean_recent_items() { :; }
+_clean_mail_downloads() { :; }
+retarget_logs() {
+    if [[ ! -L "$HOME/Library/Logs/DiagnosticReports" ]]; then
+        mv "$HOME/Library/Logs/DiagnosticReports" "$HOME/original-reports"
+        if [[ "$PHASE" == replacement ]]; then
+            mv "$HOME/authored" "$HOME/Library/Logs/DiagnosticReports"
+        else
+            ln -s "$HOME/authored" "$HOME/Library/Logs/DiagnosticReports"
+        fi
+    fi
+}
+if [[ "$PHASE" != sink ]]; then
+    get_cleanup_path_size_kb() { retarget_logs; printf '1\n'; }
+else
+    eval "$(declare -f safe_remove | sed '1s/safe_remove/_original_safe_remove/')"
+    safe_remove() { retarget_logs; _original_safe_remove "$@"; }
+fi
+clean_user_essentials
+if [[ "$PHASE" == replacement ]]; then
+    [[ -f "$HOME/Library/Logs/DiagnosticReports/report.txt" ]] || exit 1
+else
+    [[ -L "$HOME/Library/Logs/DiagnosticReports" && -f "$HOME/authored/report.txt" ]] || exit 1
+fi
+[[ ! -e "$HOME/unsafe-preview" ]] || exit 1
+EOF
+        [ "$status" -eq 0 ] || { echo "$phase: $output"; return 1; }
+    done
+}
+
+@test "standalone diagnostic logs preserve redirected roots" {
+    local relative=Library/DiagnosticReports mode
+        for mode in link replacement ordinary; do
+            local test_home="$BATS_TEST_TMPDIR/${relative//\//_}-$mode"
+            mkdir -p "$test_home/$relative" "$test_home/authored"
+            printf 'old' > "$test_home/$relative/report.txt"
+            printf 'keep' > "$test_home/authored/report.txt"
+            run env HOME="$test_home" RELATIVE="$relative" MODE="$mode" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+DRY_RUN=false
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+safe_clean() { :; }
+_clean_incomplete_downloads() { :; }
+clean_support_app_data() { :; }
+clean_group_container_caches() { :; }
+clean_handoff_pasteboard_cache() { :; }
+if [[ "$MODE" == link ]]; then
+    mv "$HOME/$RELATIVE" "$HOME/original"
+    ln -s "$HOME/authored" "$HOME/$RELATIVE"
+elif [[ "$MODE" == replacement ]]; then
+    get_cleanup_path_size_kb() {
+        mv "$HOME/$RELATIVE" "$HOME/original"
+        mv "$HOME/authored" "$HOME/$RELATIVE"
+        printf '1\n'
+    }
+fi
+clean_app_caches
+case "$MODE" in
+    link) [[ -f "$HOME/authored/report.txt" ]] || exit 1 ;;
+    replacement) [[ -f "$HOME/$RELATIVE/report.txt" ]] || exit 1 ;;
+    ordinary) [[ ! -e "$HOME/$RELATIVE/report.txt" ]] || exit 1 ;;
+esac
+EOF
+            [ "$status" -eq 0 ] || { echo "$relative $mode: $output"; return 1; }
+        done
+}
+
+@test "log cleanup entrypoints preserve cancellation statuses" {
+    local relative cancel_rc
+    for relative in Library/Logs Library/DiagnosticReports; do
+        for cancel_rc in 124 130 143; do
+            local test_home="$BATS_TEST_TMPDIR/${relative//\//_}-$cancel_rc"
+            mkdir -p "$test_home/$relative"
+            touch "$test_home/$relative/report.txt"
+            run env HOME="$test_home" RELATIVE="$relative" CANCEL_RC="$cancel_rc" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+DRY_RUN=false
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+safe_clean() { :; }
+safe_clean_guarded() { return "$CANCEL_RC"; }
+clean_trash() { touch "$HOME/continued"; }
+_clean_incomplete_downloads() { touch "$HOME/continued"; }
+case "$RELATIVE" in
+    Library/Logs) clean_user_essentials ;;
+    Library/DiagnosticReports) clean_app_caches ;;
+esac
+EOF
+            [ "$status" -eq "$cancel_rc" ] || { echo "$relative: $output"; return 1; }
+            [[ ! -e "$test_home/continued" ]] || return 1
+        done
+    done
 }
 
 @test "a custom whitelist still protects system caches, Poetry virtualenvs and the renv cache" {
@@ -686,6 +851,175 @@ EOF
     [[ ! -e "$HOME/.Trash/com.sogou.inputmethod.sogou.plist" ]] || return 1
     [[ ! -e "$HOME/.Trash/com.tencent.inputmethod.QQInput.plist" ]] || return 1
     [[ ! -d "$HOME/.Trash/Input Methods" ]]
+}
+
+@test "clean_trash dry run previews protected-name Trash items real mode empties (#1517)" {
+    rm -rf "$HOME/.Trash" # SAFE: reset this test's temporary HOME fixture before populating it
+    mkdir -p "$HOME/.Trash/Input Methods"
+    touch "$HOME/.Trash/com.sogou.inputmethod.sogou.plist"
+    touch "$HOME/.Trash/com.tencent.inputmethod.QQInput.plist"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+eval "$(awk '/^register_dry_run_cleanup_target\(\)/,/^}/' "$PROJECT_ROOT/bin/clean.sh")"
+eval "$(awk '/^record_dry_run_cleanup_target\(\)/,/^}/' "$PROJECT_ROOT/bin/clean.sh")"
+append_dry_run_cleanup_target() { :; }
+CLEAN_PREVIEW_LEDGER_FILE="$HOME/.ledger"
+: > "$CLEAN_PREVIEW_LEDGER_FILE"
+DRY_RUN=true
+stop_section_spinner() { :; }
+note_activity() { :; }
+is_path_whitelisted() { return 1; }
+clean_trash
+EOF
+
+    rm -rf "$HOME/.Trash" "$HOME/.ledger" # SAFE: test fixture HOME
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"Trash · would empty, 3 items"* ]]
+}
+
+@test "clean_trash dry run stops when the final Trash validation times out" {
+    rm -rf "$HOME/.Trash" # SAFE: reset this test's temporary HOME fixture before populating it
+    mkdir -p "$HOME/.Trash"
+    touch "$HOME/.Trash/one.tmp" "$HOME/.Trash/two.tmp"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_CURRENT_COMMAND=clean /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+DRY_RUN=true
+stop_section_spinner() { :; }
+note_activity() { :; }
+is_path_whitelisted() { return 1; }
+validate_path_for_deletion() {
+    echo "VALIDATE:$1"
+    return 124
+}
+record_dry_run_cleanup_target() { echo "UNEXPECTED_RECORD:$1"; }
+rc=0
+clean_trash || rc=$?
+printf 'RC=%s CANCEL=%s\n' "$rc" "${MOLE_CLEAN_CANCEL_STATUS:-0}"
+EOF
+
+    rm -rf "$HOME/.Trash" # SAFE: test fixture HOME
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"RC=124 CANCEL=124"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_RECORD"* ]] || return 1
+    [[ "$output" != *"would empty"* ]] || return 1
+    local validate_calls
+    validate_calls=$(grep -c '^VALIDATE:' <<< "$output" || true)
+    [ "$validate_calls" -eq 1 ]
+}
+
+@test "clean_trash dry run lists items whose sizing timed out or failed and cancels only on a signal" {
+    # The real run sizes inside safe_remove and still empties an item whose
+    # size probe timed out or failed. The preview must list the same items with
+    # an unknown size and keep later sections running; only a signal cancels.
+    local case_home="$HOME/trash-size-failure"
+    rm -rf "$case_home" # SAFE: reset this test's own fixture under the temporary HOME
+    mkdir -p "$case_home/.Trash/bigdir" "$case_home/.Trash/small"
+    touch "$case_home/.Trash/bigdir/blob" "$case_home/.Trash/small/note"
+
+    run env HOME="$case_home" PROJECT_ROOT="$PROJECT_ROOT" MOLE_CURRENT_COMMAND=clean \
+        /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+stop_section_spinner() { :; }
+note_activity() { :; }
+debug_log() { :; }
+is_path_whitelisted() { return 1; }
+validate_path_for_deletion() { return 0; }
+get_path_size_kb() {
+    if [[ "$1" == */bigdir || "${SIZE_FAIL_ALL:-0}" == 1 ]]; then
+        return "$SIZE_RC"
+    fi
+    echo 8
+}
+record_dry_run_cleanup_target() {
+    printf '%s:%s:%s\n' "${1##*/}" "$2" "$4" >> "$HOME/recorded"
+}
+safe_remove() {
+    printf '%s\n' "${1##*/}" >> "$HOME/removed"
+    return 0
+}
+
+for scenario in 124:0 1:0 130:1 143:1; do
+    SIZE_RC="${scenario%%:*}"
+    SIZE_FAIL_ALL="${scenario##*:}"
+    MOLE_CLEAN_CANCEL_STATUS=0
+    MOLE_CLEAN_SIZING_TIMEOUTS=0
+    : > "$HOME/recorded"
+    : > "$HOME/removed"
+    DRY_RUN=true
+    rc=0
+    clean_trash > "$HOME/dry.out" || rc=$?
+    rows=$(grep -c 'would empty, 2 items' "$HOME/dry.out" || true)
+    printf 'SCENARIO=%s RC=%s CANCEL=%s PARTIAL=%s ROWS=%s RECORDED=[%s]\n' \
+        "$scenario" "$rc" "$MOLE_CLEAN_CANCEL_STATUS" "$MOLE_CLEAN_SIZING_TIMEOUTS" "$rows" \
+        "$(sort "$HOME/recorded" | tr '\n' ',')"
+    if [[ "$rc" -eq 0 ]]; then
+        DRY_RUN=false
+        clean_trash > /dev/null
+        previewed=$(cut -d: -f1 "$HOME/recorded" | sort | tr '\n' ',')
+        removed=$(sort "$HOME/removed" | tr '\n' ',')
+        [[ "$previewed" == "$removed" ]] || exit 1
+        printf 'PARITY=%s\n' "$removed"
+    fi
+done
+EOF
+
+    rm -rf "$case_home" # SAFE: test fixture under the temporary HOME
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"SCENARIO=124:0 RC=0 CANCEL=0 PARTIAL=1 ROWS=1 RECORDED=[bigdir:0:false,small:8:true,]"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"SCENARIO=1:0 RC=0 CANCEL=0 PARTIAL=1 ROWS=1 RECORDED=[bigdir:0:false,small:8:true,]"* ]] || { echo "$output"; return 1; }
+    [ "$(grep -c '^PARITY=bigdir,small,$' <<< "$output")" -eq 2 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"SCENARIO=130:1 RC=130 CANCEL=130 PARTIAL=0 ROWS=0 RECORDED=[]"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"SCENARIO=143:1 RC=143 CANCEL=143 PARTIAL=0 ROWS=0 RECORDED=[]"* ]] || { echo "$output"; return 1; }
+}
+
+@test "clean_trash dry run lists an item whose size probe skipped an unreadable child" {
+    # du exits 1 when a child directory is unreadable, and get_path_size_kb
+    # refuses to call that partial number a size. The preview used to return
+    # silently and drop the whole Trash row while the real run emptied it.
+    local case_home="$HOME/trash-unreadable-child"
+    chmod -R u+rwx "$case_home" 2> /dev/null || true
+    rm -rf "$case_home" # SAFE: reset this test's own fixture under the temporary HOME
+    mkdir -p "$case_home/.Trash/locked/inner" "$case_home/.Trash/plain"
+    touch "$case_home/.Trash/locked/inner/secret" "$case_home/.Trash/plain/note"
+    chmod 000 "$case_home/.Trash/locked/inner"
+
+    run env HOME="$case_home" PROJECT_ROOT="$PROJECT_ROOT" MOLE_CURRENT_COMMAND=clean \
+        /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+DRY_RUN=true
+stop_section_spinner() { :; }
+note_activity() { :; }
+is_path_whitelisted() { return 1; }
+size_rc=0
+get_path_size_kb "$HOME/.Trash/locked" > /dev/null 2>&1 || size_rc=$?
+printf 'PROBE_RC=%s\n' "$size_rc"
+rc=0
+clean_trash || rc=$?
+printf 'RC=%s CANCEL=%s\n' "$rc" "${MOLE_CLEAN_CANCEL_STATUS:-0}"
+EOF
+
+    chmod -R u+rwx "$case_home"
+    rm -rf "$case_home" # SAFE: test fixture under the temporary HOME
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"PROBE_RC=1"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"Trash · would empty, 2 items"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"RC=0 CANCEL=0"* ]] || { echo "$output"; return 1; }
 }
 
 @test "clean_user_essentials keeps Mole runtime logs while cleaning other user logs" {
@@ -1411,11 +1745,16 @@ EOF
 }
 
 @test "explicit App Container cleanup families expose one cumulative probe deadline (#1471)" {
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+    local fixture_home="$HOME/container-probe-deadline"
+    run env HOME="$fixture_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/app_caches.sh"
 source "$PROJECT_ROOT/lib/clean/user.sh"
+pgrep() {
+    printf '%s\n' "$*" >> "$HOME/process-trace"
+    return 1
+}
 start_section_spinner() { :; }
 stop_section_spinner() { :; }
 note_activity() { :; }
@@ -1449,9 +1788,9 @@ echo x > "$HOME/Library/Containers/com.utmapp.UTM/Data/Library/Caches/blob"
 clean_app_caches
 clean_office_applications
 clean_utm_caches
+grep -qxF -- '-x UTM' "$HOME/process-trace" || exit 1
 EOF
 
-    rm -rf "$HOME/Library/Containers/com.utmapp.UTM"
     [ "$status" -eq 0 ] || return 1
     [[ "$output" == *"SCOPED=Wallpaper agent cache"* ]] || return 1
     [[ "$output" == *"SCOPED=Microsoft Word container cache"* ]] || return 1
@@ -1807,6 +2146,93 @@ EOF
     [[ "$output" != *"SHOULD_NOT_SIZE_SCAN"* ]]
 }
 
+@test "container cache counters run in the caller's shell and restore glob options" {
+    # Own HOME: earlier cases leave Group Containers fixtures in the shared one,
+    # and every extra candidate adds a counter call.
+    local counter_home
+    counter_home=$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-counter-home.XXXXXX")
+    run env HOME="$counter_home" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=true /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+bytes_to_human() { echo "0B"; }
+note_activity() { :; }
+should_protect_data() { return 1; }
+should_protect_path() { return 1; }
+is_path_whitelisted() { return 1; }
+holds_compiled_model_cache() { return 1; }
+_mole_user_cache_owner_process_state() { return 1; }
+_MOLE_COMPLETE_LSOF_MODE=direct
+lsof() { return 1; }
+run_with_timeout() { shift; "$@"; }
+get_path_size_kb() { printf '7\n'; }
+record_dry_run_cleanup_target() { return 0; }
+files_cleaned=0
+total_size_cleaned=0
+total_items=0
+
+# A call made through $(...) increments this counter in a subshell, so the
+# owning shell sees zero: the count only survives a direct call.
+eval "$(declare -f cache_top_level_entry_count_capped | sed '1s/^cache_top_level_entry_count_capped/_counted_entry_count_capped/')"
+COUNTER_CALLS=0
+cache_top_level_entry_count_capped() {
+    COUNTER_CALLS=$((COUNTER_CALLS + 1))
+    _counted_entry_count_capped "$@"
+}
+
+probe="$HOME/counter-probe"
+mkdir -p "$probe"
+touch "$probe/.hidden" "$probe/a" "$probe/b"
+shopt -u nullglob dotglob
+cache_top_level_entry_count_capped "$probe" 101
+printf 'DIRECT_COUNT=%s\n' "$CACHE_TOP_LEVEL_ENTRY_COUNT"
+cache_top_level_entry_count_capped "$probe" 2
+printf 'CAPPED_COUNT=%s\n' "$CACHE_TOP_LEVEL_ENTRY_COUNT"
+printf 'OFF_AFTER=%s%s\n' "$(shopt -q nullglob && echo N || echo n)" "$(shopt -q dotglob && echo D || echo d)"
+shopt -s nullglob dotglob
+cache_top_level_entry_count_capped "$probe" 101
+printf 'ON_AFTER=%s%s\n' "$(shopt -q nullglob && echo N || echo n)" "$(shopt -q dotglob && echo D || echo d)"
+shopt -u nullglob dotglob
+COUNTER_CALLS=0
+
+container="$HOME/Library/Containers/com.example.counter"
+mkdir -p "$container/Data/Library/Caches/one"
+touch "$container/Data/Library/Caches/one/data.tmp"
+total_size=0
+total_size_partial=false
+cleaned_count=0
+found_any=false
+precise_size_limit=64
+precise_size_used=0
+process_container_cache "$container"
+printf 'CONTAINER_CALLS=%s\n' "$COUNTER_CALLS"
+
+mkdir -p "$HOME/Library/Group Containers/group.com.example.counter/Library/Caches"
+for i in $(seq 1 101); do
+    touch "$HOME/Library/Group Containers/group.com.example.counter/Library/Caches/file-$i.tmp"
+done
+clean_group_container_caches
+printf 'TOTAL_CALLS=%s\n' "$COUNTER_CALLS"
+printf 'GLOBS_AFTER=%s%s\n' "$(shopt -q nullglob && echo N || echo n)" "$(shopt -q dotglob && echo D || echo d)"
+EOF
+
+    rm -rf "$counter_home" # SAFE: this test's own mktemp HOME
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"DIRECT_COUNT=3"* ]] || return 1
+    [[ "$output" == *"CAPPED_COUNT=2"* ]] || return 1
+    [[ "$output" == *"OFF_AFTER=nd"* ]] || return 1
+    [[ "$output" == *"ON_AFTER=ND"* ]] || return 1
+    [[ "$output" == *"CONTAINER_CALLS=1"* ]] || return 1
+    [[ "$output" == *"Group Containers logs/caches"* ]] || return 1
+    [[ "$output" == *"TOTAL_CALLS=2"* ]] || return 1
+    [[ "$output" == *"GLOBS_AFTER=nd"* ]]
+}
+
 @test "clean_finder_metadata respects protection flag" {
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" PROTECT_FINDER_METADATA=true /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
@@ -1823,10 +2249,17 @@ EOF
 }
 
 @test "clean_browsers calls expected cache paths" {
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=true /bin/bash --noprofile --norc << 'EOF'
+    local fixture_home="$HOME/browser-cache-paths"
+    run env HOME="$fixture_home" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=true /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
+mkdir -p "$HOME/Library/Caches/Firefox"
+touch "$HOME/Library/Caches/Firefox/candidate"
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/user.sh"
+pgrep() {
+    printf '%s\n' "$*" >> "$HOME/process-trace"
+    return 1
+}
 safe_clean() { echo "$2"; }
 clean_service_worker_cache() { :; }
 note_activity() { :; }
@@ -1834,9 +2267,10 @@ files_cleaned=0
 total_size_cleaned=0
 total_items=0
 clean_browsers
+grep -qxF -- '-x Firefox' "$HOME/process-trace" || exit 1
 EOF
 
-    [ "$status" -eq 0 ]
+    [ "$status" -eq 0 ] || return 1
     [[ "$output" == *"Safari cache"* ]] || return 1
     [[ "$output" == *"Firefox cache"* ]] || return 1
     [[ "$output" == *"Puppeteer browser cache"* ]]
@@ -2770,6 +3204,94 @@ EOF
     [[ "$output" == *"Android emulators"* ]]
 }
 
+@test "large files keeps a du total that skipped unreadable entries" {
+    local review_home
+    review_home=$(mktemp -d "$HOME/du-partial.XXXXXX")
+    mkdir -p "$review_home/Library/Developer/CoreSimulator/Devices"
+    run env HOME="$review_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+defaults() { return 1; }
+docker() { return 1; }
+run_with_timeout() {
+    shift
+    if [[ "$1" == du ]]; then
+        # BSD du prints the readable total and exits 1 for an unreadable entry.
+        printf '12000000\t%s\n' "${!#}"
+        return 1
+    fi
+    "$@"
+}
+check_large_file_candidates
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"Simulator data"* ]]
+}
+
+@test "large files skips an E5RT total that missed unreadable entries (#1631)" {
+    local review_home
+    review_home=$(mktemp -d "$HOME/e5rt-partial.XXXXXX")
+    mkdir -p "$review_home/Library/Caches/python/com.apple.e5rt.e5bundlecache" \
+        "$review_home/Library/Developer/CoreSimulator/Devices"
+    run env HOME="$review_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+defaults() { return 1; }
+docker() { return 1; }
+run_with_timeout() {
+    shift
+    if [[ "$1" == du ]]; then
+        # BSD du prints the readable total and exits 1 for an unreadable entry.
+        printf '12000000\t%s\n' "${!#}"
+        return 1
+    fi
+    "$@"
+}
+check_large_file_candidates
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" != *"Compiled model cache"* ]] || return 1
+    [[ "$output" == *"Simulator data"* ]]
+}
+
+@test "large files continues later rows when the E5RT listing has no scratch file" {
+    local review_home
+    review_home=$(mktemp -d "$HOME/e5rt-scratch.XXXXXX")
+    mkdir -p "$review_home/Library/Caches/python/com.apple.e5rt.e5bundlecache" "$review_home/.android/avd"
+    run env HOME="$review_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { echo "ACTIVITY"; }
+defaults() { return 1; }
+docker() { return 1; }
+create_temp_file() { return 1; }
+run_with_timeout() {
+    shift
+    if [[ "$1" == du ]]; then
+        printf '75497472\t%s\n' "${!#}"
+        return 0
+    fi
+    "$@"
+}
+check_large_file_candidates
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" != *"Compiled model cache"* ]] || return 1
+    [[ "$output" == *"Android emulators"* ]] || return 1
+    [[ "$output" == *"ACTIVITY"* ]]
+}
+
 @test "large files discards incomplete E5RT discovery and propagates measurement signals (#1631)" {
     local review_home
     review_home=$(mktemp -d "$HOME/e5rt-errors.XXXXXX")
@@ -2883,6 +3405,295 @@ EOF
     # Report only: both SDK folders must still exist afterwards.
     [ -d "$review_home/fvm/versions/3.47.5" ] &&
         [ -d "$review_home/custom-fvm/versions/3.44.0" ]
+}
+
+@test "large files links the full path behind a two-segment label" {
+    local review_home="$HOME/large-review-short-path"
+    mkdir -p "$review_home/Library/Application Support/MobileSync/Backup/00008150-DEVICE" "$review_home/.gradle/caches"
+
+    run env HOME="$review_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+docker() { return 1; }
+defaults() { return 1; }
+format_path_link() { printf 'LINK<%s>TEXT<%s>' "$1" "${2:-}"; }
+du() { printf '2097152 %s\n' "${2:-/tmp}"; }
+run_with_timeout() {
+    shift
+    "$@"
+}
+check_large_file_candidates
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"LINK<$review_home/Library/Application Support/MobileSync/Backup>TEXT<…/MobileSync/Backup>"* ]] || { echo "$output"; return 1; }
+    # A path that is already short keeps its full form.
+    [[ "$output" == *"TEXT<~/.gradle/caches>"* ]] || { echo "$output"; return 1; }
+}
+
+@test "large files measures each row once, at most four at a time, and prints them in order" {
+    local review_home="$HOME/large-review-pool"
+    # path|label in queue order. Each row gets its own size, so a result read
+    # from a neighbouring row's file prints a wrong size on that row.
+    local -a pool_rows=(
+        "Library/Developer/Xcode/DerivedData|Xcode DerivedData"
+        "Library/Developer/CoreSimulator/Devices|Simulator data"
+        "Library/Application Support/MobileSync/Backup|iOS backups"
+        "Library/Mail|Mail data"
+        "Library/Updates|macOS updates cache"
+        ".lima|Lima data"
+        ".m2/repository|Maven local repository"
+        ".ivy2/cache|Ivy local repository"
+        ".nuget/packages|NuGet packages"
+        "Library/pnpm/store|pnpm store"
+        ".conda/pkgs|Conda packages"
+        ".gradle/caches|Gradle caches"
+    )
+    local entry row index=0
+    mkdir -p "$review_home"
+    : > "$review_home/sizes"
+    for entry in "${pool_rows[@]}"; do
+        row="${entry%%|*}"
+        mkdir -p "$review_home/$row"
+        # Row N reads as N.00GB: 976563 KB is just over 1e9 bytes.
+        printf '%s\t%s\n' "$review_home/$row" "$(((index + 2) * 976563))" >> "$review_home/sizes"
+        index=$((index + 1))
+    done
+    # Developer shells and CI runners export these; the fixture HOME must win.
+    run env -u ANDROID_AVD_HOME -u ANDROID_HOME -u ANDROID_SDK_ROOT -u DENO_DIR -u FVM_CACHE_PATH -u HF_HOME -u MISE_DATA_DIR \
+        HOME="$review_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+docker() { return 1; }
+defaults() { return 1; }
+format_path_link() { printf '%s' "$1"; }
+mkdir -p "$HOME/live"
+run_with_timeout() {
+    shift
+    if [[ "$1" == du ]]; then
+        local marker="$HOME/live/$RANDOM.$RANDOM"
+        : > "$marker"
+        printf '%s\n' "${!#}" >> "$HOME/du.calls"
+        ls "$HOME/live" | wc -l | tr -d ' ' >> "$HOME/concurrency"
+        sleep 0.3
+        command rm -f "$marker"
+        printf '%s\t%s\n' "$(awk -F'\t' -v p="${!#}" '$1 == p { print $2 }' "$HOME/sizes")" "${!#}"
+        return 0
+    fi
+    "$@"
+}
+check_large_file_candidates
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    # One measurement per folder: a lost pool state re-measured later rows.
+    local repeated
+    repeated=$(sort "$review_home/du.calls" | uniq -d)
+    [[ -z "$repeated" ]] || { echo "measured twice: $repeated"; return 1; }
+    [[ "$(wc -l < "$review_home/du.calls" | tr -d ' ')" -eq ${#pool_rows[@]} ]] || { cat "$review_home/du.calls"; return 1; }
+    local peak
+    peak=$(sort -n "$review_home/concurrency" | tail -1)
+    [[ "$peak" -ge 2 && "$peak" -le 4 ]] || { echo "peak=$peak"; return 1; }
+    # Every row prints the size measured for its own folder.
+    local plain
+    plain=$(printf '%s\n' "$output" | sed "s/$(printf '\033')\[[0-9;]*m//g")
+    index=0
+    for entry in "${pool_rows[@]}"; do
+        grep -qF -- "${entry#*|} · $((index + 2)).00GB" <<< "$plain" || { echo "wrong size for ${entry#*|}"; echo "$plain"; return 1; }
+        index=$((index + 1))
+    done
+    # Rows keep their report order whatever order the sizes arrive in.
+    local order
+    order=$(printf '%s\n' "$output" | grep -oE 'Mail data|Xcode DerivedData|Simulator data|iOS backups|Maven local repository|Gradle caches' | tr '\n' ',')
+    [[ "$order" == "Mail data,Xcode DerivedData,Simulator data,iOS backups,Maven local repository,Gradle caches," ]] || { echo "order=$order"; return 1; }
+}
+
+@test "large files still reports rows after slow ones use up the shared budget" {
+    local review_home="$HOME/large-review-budget"
+    # The first four queued rows start the pool; the other four wait behind
+    # them. The budget is 6 s, so the first wave gets 4 to 6 s per row.
+    mkdir -p \
+        "$review_home/Library/Developer/Xcode/DerivedData" \
+        "$review_home/Library/Developer/CoreSimulator/Devices" \
+        "$review_home/Library/Mail" \
+        "$review_home/Library/Mail Downloads" \
+        "$review_home/Library/Updates" \
+        "$review_home/.lima" \
+        "$review_home/.m2/repository" \
+        "$review_home/.gradle/caches"
+    run env -u ANDROID_AVD_HOME -u ANDROID_HOME -u ANDROID_SDK_ROOT -u DENO_DIR -u FVM_CACHE_PATH -u HF_HOME -u MISE_DATA_DIR \
+        HOME="$review_home" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TIMEOUT_HINT_SCAN_SEC=6 /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+docker() { return 1; }
+defaults() { return 1; }
+format_path_link() { printf '%s' "$1"; }
+run_with_timeout() {
+    local seconds="$1"
+    shift
+    if [[ "$1" == du ]]; then
+        printf '%s %s %s\n' "$SECONDS" "$seconds" "${!#}" >> "$HOME/du.calls"
+        # A row granted more than the 3 s inline budget hangs for all of it.
+        if [[ "${seconds%%.*}" -gt 3 ]]; then
+            sleep "$seconds"
+            return 124
+        fi
+        printf '2097152\t%s\n' "${!#}"
+        return 0
+    fi
+    "$@"
+}
+check_large_file_candidates
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    # Positive control: the pool did start and its first wave used up the
+    # shared budget, so those rows were skipped as timed out.
+    [[ "$output" != *"Xcode DerivedData"* && "$output" != *"Simulator data"* &&
+        "$output" != *"Mail data"* && "$output" != *"Mail downloads"* ]] || { echo "$output"; cat "$review_home/du.calls"; return 1; }
+    # Rows still queued when the deadline passed keep their inline budget
+    # instead of inheriting a pool budget, so these four still report.
+    [[ "$output" == *"macOS updates cache"* && "$output" == *"Lima data"* &&
+        "$output" == *"Maven local repository"* && "$output" == *"Gradle caches"* ]] || { echo "$output"; cat "$review_home/du.calls"; return 1; }
+}
+
+@test "large files leaves a row the pool cannot fully budget to the inline probe" {
+    local review_home="$HOME/large-review-floor"
+    mkdir -p \
+        "$review_home/Library/Developer/Xcode/DerivedData" \
+        "$review_home/Library/Developer/CoreSimulator/Devices" \
+        "$review_home/Library/Application Support/MobileSync/Backup" \
+        "$review_home/Library/Mail" \
+        "$review_home/Library/Mail Downloads"
+    run env -u ANDROID_AVD_HOME -u ANDROID_HOME -u ANDROID_SDK_ROOT -u DENO_DIR -u FVM_CACHE_PATH -u HF_HOME -u MISE_DATA_DIR \
+        HOME="$review_home" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TIMEOUT_HINT_SCAN_SEC=4 /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+docker() { return 1; }
+defaults() { return 1; }
+format_path_link() { printf '%s' "$1"; }
+run_with_timeout() {
+    local seconds="$1"
+    shift
+    if [[ "$1" == du ]]; then
+        case "${!#}" in
+            */Mail\ Downloads)
+                # Needs about two seconds: a cut pool budget would time out.
+                if [[ "${seconds%%.*}" -lt 2 ]]; then sleep "$seconds"; return 124; fi
+                sleep 1.5
+                ;;
+            *) sleep 3 ;;
+        esac
+        printf '2097152\t%s\n' "${!#}"
+        return 0
+    fi
+    "$@"
+}
+check_large_file_candidates
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"Mail downloads"* ]] || { echo "$output"; return 1; }
+}
+
+@test "large files searches for agent worktrees once" {
+    local review_home="$HOME/large-review-worktrees"
+    # A queued row makes the size pool and the background search both run.
+    mkdir -p "$review_home/www/app/.claude/worktrees/one" "$review_home/.gradle/caches"
+    run env -u ANDROID_AVD_HOME -u ANDROID_HOME -u ANDROID_SDK_ROOT -u DENO_DIR -u FVM_CACHE_PATH -u HF_HOME -u MISE_DATA_DIR \
+        HOME="$review_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+docker() { return 1; }
+defaults() { return 1; }
+eval "real_$(declare -f agent_worktree_containers)"
+agent_worktree_containers() { printf 'search\n' >> "$HOME/searches"; real_agent_worktree_containers "$@"; }
+get_path_size_kb() { printf '2097152\n'; }
+check_large_file_candidates
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$(wc -l < "$review_home/searches" | tr -d ' ')" -eq 1 ]] || { cat "$review_home/searches"; return 1; }
+    [[ "$output" == *"AI agent worktrees"* ]] || { echo "$output"; return 1; }
+}
+
+@test "large files queues every fixed review row for early measurement" {
+    local review_home="$HOME/large-review-queue"
+    local -a queued_rows=(
+        "Library/Mail" "Library/Mail Downloads" "Library/Updates"
+        "Library/Developer/Xcode/DerivedData" "Library/Developer/Xcode/Archives"
+        "Library/Developer/CoreSimulator/Devices" "Library/Containers/com.docker.docker/Data"
+        "Library/Application Support/MobileSync/Backup" ".lmstudio/models"
+        "Library/Group Containers/HUAQ24HBR6.dev.orbstack/data" "OrbStack" ".lima"
+        ".m2/repository" ".ivy2/cache" ".nuget/packages" "Library/Caches/deno"
+        "Library/pnpm/store"
+        ".conda/pkgs" "anaconda3/pkgs" ".gradle/caches" ".android/avd"
+        "Library/Android/sdk/system-images" ".cache/huggingface"
+        ".local/share/mise/installs/node" "fvm/versions"
+    )
+    local row
+    for row in "${queued_rows[@]}"; do
+        mkdir -p "$review_home/$row"
+    done
+    # CI runners export ANDROID_HOME; every row must resolve under the fixture.
+    run env -u ANDROID_AVD_HOME -u ANDROID_HOME -u ANDROID_SDK_ROOT -u DENO_DIR -u FVM_CACHE_PATH -u HF_HOME -u MISE_DATA_DIR \
+        HOME="$review_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+_large_prefetch_queue_rows
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    for row in "${queued_rows[@]}"; do
+        grep -Fxq -- "$review_home/$row" <<< "$output" || { echo "missing $row"; return 1; }
+    done
+}
+
+@test "large files queue lists every fixed HOME row the report measures" {
+    local review_home="$HOME/large-review-drift"
+    # Rows spelled as a literal $HOME path in the report are the ones a new
+    # row can silently miss; comment lines are skipped so this prose cannot
+    # satisfy the pattern, and an empty match must fail instead of passing.
+    local -a report_rows=()
+    local report_row
+    # shellcheck disable=SC2016  # The patterns match the literal text $HOME in user.sh.
+    while IFS= read -r report_row; do
+        report_rows+=("$report_row")
+    done < <(grep -v '^[[:space:]]*#' "$PROJECT_ROOT/lib/clean/user.sh" |
+        grep -oE '_report_large_or_stop "[^"]+" "\$HOME/[^"]+"' |
+        sed -E 's/.*"\$HOME\/([^"]+)"$/\1/')
+    [ "${#report_rows[@]}" -gt 10 ] || { echo "matched ${#report_rows[@]} report rows"; return 1; }
+    for report_row in "${report_rows[@]}"; do
+        mkdir -p "$review_home/$report_row"
+    done
+
+    run env -u ANDROID_AVD_HOME -u ANDROID_HOME -u ANDROID_SDK_ROOT -u DENO_DIR -u FVM_CACHE_PATH -u HF_HOME -u MISE_DATA_DIR \
+        HOME="$review_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+_large_prefetch_queue_rows
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    for report_row in "${report_rows[@]}"; do
+        grep -Fxq -- "$review_home/$report_row" <<< "$output" || { echo "report row not queued: $report_row"; return 1; }
+    done
 }
 
 @test "large files dates the irreplaceable rows and leaves caches undated" {

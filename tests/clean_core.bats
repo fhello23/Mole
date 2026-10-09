@@ -324,6 +324,85 @@ EOF
     [[ "$output" != *"2 items"* ]]
 }
 
+@test "safe_clean_guarded skips only the path its guard names and keeps going" {
+    # Both size branches (three targets or fewer, and more) in real and dry-run
+    # mode each have their own guard site.
+    local mode count failures=0
+    for mode in real dry; do
+        for count in 3 4; do
+            run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MODE="$mode" COUNT="$count" \
+                BASE="$HOME/safe_clean_guarded_skip_${mode}_${count}" MOLE_TEST_MODE=1 \
+                /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/bin/clean.sh"
+DRY_RUN=false
+[[ "$MODE" != dry ]] || DRY_RUN=true
+files_cleaned=0
+total_size_cleaned=0
+total_items=0
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+start_inline_spinner() { :; }
+stop_inline_spinner() { :; }
+note_activity() { :; }
+is_path_whitelisted() { return 1; }
+get_cleanup_path_size_kb() { echo 1; }
+record_dry_run_cleanup_target() { printf '%s\n' "$1" >> "$BASE/preview"; }
+safe_remove() { /bin/rm -rf "$1"; return 0; }
+# Names the path it refuses, so the batch goes on without it.
+skip_guard() {
+    [[ "$1" != "$BASE/t2" ]] || { _MOLE_SAFE_CLEAN_SKIP_PATH="$1"; return 1; }
+}
+# Refuses the same path without naming it, which stops the batch.
+stop_guard() { [[ "$1" != "$BASE/t2" ]]; }
+handled() {
+    if [[ "$MODE" == dry ]]; then
+        [[ -f "$BASE/preview" ]] && grep -Fxq "$1" "$BASE/preview"
+    else
+        [[ ! -e "$1" ]]
+    fi
+}
+reset() {
+    rm -rf "$BASE"
+    targets=()
+    local i
+    for ((i = 1; i <= COUNT; i++)); do
+        mkdir -p "$BASE/t$i"
+        targets+=("$BASE/t$i")
+    done
+}
+
+reset
+rc=0
+safe_clean_guarded skip_guard "${targets[@]}" "Skip guard" || rc=$?
+[[ $rc -eq 0 ]] || { echo "SKIP_RC:$rc"; exit 1; }
+for ((i = 1; i <= COUNT; i++)); do
+    if [[ $i -eq 2 ]]; then
+        ! handled "$BASE/t$i" || { echo "SKIP_HANDLED:t$i"; exit 1; }
+    else
+        handled "$BASE/t$i" || { echo "SKIP_MISSED:t$i"; exit 1; }
+    fi
+done
+
+reset
+rc=0
+safe_clean_guarded stop_guard "${targets[@]}" "Stop guard" || rc=$?
+[[ $rc -eq 75 ]] || { echo "STOP_RC:$rc"; exit 1; }
+handled "$BASE/t1" || { echo "STOP_MISSED:t1"; exit 1; }
+for ((i = 2; i <= COUNT; i++)); do
+    ! handled "$BASE/t$i" || { echo "STOP_HANDLED:t$i"; exit 1; }
+done
+EOF
+            [ "$status" -eq 0 ] || {
+                echo "$mode/$count: $output"
+                failures=$((failures + 1))
+            }
+        done
+    done
+    [ "$failures" -eq 0 ] || return 1
+}
+
 @test "safe_clean_guarded filters ineligible targets before the dry-run guard" {
     local base="$HOME/safe_clean_guarded_filtered"
     mkdir -p "$base/protected" "$base/whitelisted"
@@ -2139,4 +2218,82 @@ EOF
         echo "$folded"
         return 1
     }
+}
+
+@test "Space skips later privileged cleanup even when credentials become cached" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+fixture=$(mktemp -d "$HOME/sudo-choice.XXXXXX")
+export MOLE_XCODE_DOCUMENTATION_CACHE_DIR="$fixture/docs"
+export MOLE_XCODE_SYSTEM_CORESIMULATOR_CACHE_DIR="$fixture/simulator"
+mkdir -p "$MOLE_XCODE_DOCUMENTATION_CACHE_DIR/DeveloperDocumentation.index" "$MOLE_XCODE_DOCUMENTATION_CACHE_DIR/DeveloperDocumentation-old.index" "$MOLE_XCODE_SYSTEM_CORESIMULATOR_CACHE_DIR/entry"
+is_path_whitelisted() { return 1; }
+should_protect_path() { return 1; }
+holds_compiled_model_cache() { return 1; }
+_xcode_xctest_devices_process_running() { return 1; }
+_coresimulator_cache_process_running() { return 1; }
+_coresimulator_booted_device_state() { return 1; }
+note_activity() { :; }
+get_path_size_kb() { echo 1; }
+_sim_runtime_size_kb() { echo 1; }
+has_sudo_session() { return 1; }
+ensure_sudo_session() { echo auth >> "$fixture/privileged"; return 1; }
+safe_sudo_remove() { echo remove >> "$fixture/privileged"; }
+_mole_bounded_sudo() { echo probe >> "$fixture/privileged"; return 1; }
+read_key() { echo SPACE; }
+prompt_for_system_clean
+# No authorization prompts after the explicit choice.
+clean_xcode_documentation_cache
+clean_xcode_system_coresimulator_caches
+# A credential refreshed elsewhere is not consent for this cleanup.
+has_sudo_session() { return 0; }
+clean_xcode_documentation_cache
+clean_xcode_system_coresimulator_caches
+MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=0 clean_orphaned_system_services
+[[ ! -e "$fixture/privileged" ]] || { cat "$fixture/privileged"; exit 1; }
+[[ -d "$MOLE_XCODE_SYSTEM_CORESIMULATOR_CACHE_DIR/entry" ]] || exit 1
+# Positive control: allowing system cleanup reaches the same real functions.
+SYSTEM_CLEAN=true
+has_sudo_session() { return 1; }
+clean_xcode_documentation_cache
+clean_xcode_system_coresimulator_caches
+MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=0 clean_orphaned_system_services
+[[ "$(cat "$fixture/privileged")" == $'auth\nauth\nprobe' ]] || exit 1
+SCRIPT
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "skipping system cleanup keeps browser removal and simulator sizing unprivileged" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+fixture=$(mktemp -d "$HOME/user-only.XXXXXX")
+export MOLE_CHROME_APP_PATHS="$fixture/Google Chrome.app"
+versions="$MOLE_CHROME_APP_PATHS/Contents/Frameworks/Google Chrome Framework.framework/Versions"
+mkdir -p "$versions/128.0.0.0" "$versions/129.0.0.0"
+ln -s 129.0.0.0 "$versions/Current"
+touch -t 202401010000 "$versions/128.0.0.0"
+touch -t 202402010000 "$versions/129.0.0.0"
+pgrep() { return 1; }
+is_path_whitelisted() { return 1; }
+should_protect_path() { return 1; }
+has_sudo_session() { return 0; }
+get_path_size_kb() { echo 1; }
+note_activity() { :; }
+safe_remove() { echo user >> "$fixture/actions"; }
+safe_sudo_remove() { echo privileged >> "$fixture/actions"; }
+run_with_timeout() { printf '%s\n' "$*" >> "$fixture/probes"; echo '1 fixture'; }
+SYSTEM_CLEAN=false
+clean_chrome_old_versions
+_sim_runtime_size_kb "$fixture" > /dev/null
+[[ "$(cat "$fixture/actions")" == user ]] || exit 1
+[[ "$(cat "$fixture/probes")" != *sudo* ]] || exit 1
+SYSTEM_CLEAN=true
+clean_chrome_old_versions
+_sim_runtime_size_kb "$fixture" > /dev/null
+[[ "$(cat "$fixture/actions")" == $'user\nprivileged' ]] || exit 1
+[[ "$(cat "$fixture/probes")" == *'sudo -n du'* ]] || exit 1
+SCRIPT
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
 }

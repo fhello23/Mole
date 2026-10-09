@@ -42,15 +42,22 @@ clean_tool_cache() {
         if [[ $command_rc -eq 0 ]]; then
             echo -e "  ${GREEN}${ICON_SUCCESS}${NC} $description"
             note_activity
-        elif ! mole_rc_timeout_or_signal "$command_rc" || mole_rc_timeout "$command_rc"; then
+        elif ! mole_rc_signal "$command_rc"; then
             # Routine owner failures stay in diagnostics, without a success
-            # row or activity marker. A timeout here skips this one tool.
+            # row or activity marker. A timeout here skips this one tool, and
+            # mole.log names it so a slow tool is not left to guesswork.
+            # Owners may return errno-derived statuses such as npm's 243.
+            # Only a status that names a real signal can cancel later work.
             debug_log "$description: owner command exited $command_rc: $*"
+            if mole_rc_timeout "$command_rc"; then
+                log_warning_to_file "$description timed out and was skipped: $*"
+            fi
         else
             # Ctrl-C while the owner command holds the terminal reaches only
             # the child. Record it and hand it back so no later owner command
             # starts.
-            _mole_record_clean_cancellation "$command_rc"
+            debug_log "$description: owner command interrupted (exit $command_rc): $*"
+            _mole_record_clean_cancellation "$command_rc" "$description"
             return "$command_rc"
         fi
     else
@@ -514,11 +521,18 @@ clean_dev_npm() {
             if [[ -t 1 ]]; then
                 start_section_spinner "Cleaning bun cache..."
             fi
-            if run_with_timeout "$MOLE_TIMEOUT_PKG_LIST_SEC" bun pm cache rm > /dev/null 2>&1; then
-                bun_cache_cleaned=true
-            fi
+            local bun_rm_rc=0
+            run_with_timeout "$MOLE_TIMEOUT_PKG_LIST_SEC" bun pm cache rm > /dev/null 2>&1 || bun_rm_rc=$?
+            [[ $bun_rm_rc -ne 0 ]] || bun_cache_cleaned=true
             if [[ -t 1 ]]; then
                 stop_section_spinner
+            fi
+            if mole_rc_signal "$bun_rm_rc"; then
+                # Ctrl-C while the owner command holds the terminal reaches
+                # only the child: stop instead of removing the cache directly.
+                debug_log "bun cache: owner command interrupted (exit $bun_rm_rc)"
+                _mole_record_clean_cancellation "$bun_rm_rc" "bun cache"
+                return "$bun_rm_rc"
             fi
             if [[ "$bun_cache_cleaned" == "true" ]]; then
                 echo -e "  ${GREEN}${ICON_SUCCESS}${NC} bun cache"
@@ -993,7 +1007,17 @@ clean_go_cache_root() {
         note_activity
         return 0
     fi
-    if mole_rc_timeout_or_signal "$command_status"; then
+    if mole_rc_timeout "$command_status"; then
+        # A timed-out `go clean` skips this one cache instead of cancelling
+        # unrelated cleanup, as clean_tool_cache does for its owner commands.
+        # Go may already have removed part of the root, so say it stopped.
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} ${display_name} · stopped (timed out)"
+        note_activity
+        log_warning_to_file "$display_name timed out after ${MOLE_TIMEOUT_PKG_CLEANUP_SEC}s and was skipped: go clean $clean_flag $physical_root"
+        return 0
+    fi
+    if mole_rc_signal "$command_status"; then
+        _mole_record_clean_cancellation "$command_status" "$display_name"
         return "$command_status"
     fi
 
@@ -1020,12 +1044,20 @@ clean_dev_go() {
     local go_build_cache=""
     local resolver_rc=0
     go_mod_cache=$(mole_go_cache_root GOMODCACHE) || resolver_rc=$?
-    if mole_rc_timeout_or_signal "$resolver_rc"; then
+    # A slow `go env` leaves the roots unknown and nothing was deleted, so it
+    # skips the Go caches only; a signal still stops the run.
+    if mole_rc_timeout "$resolver_rc"; then
+        debug_log "Skipping Go caches: go env GOMODCACHE timed out"
+        return 0
+    elif mole_rc_timeout_or_signal "$resolver_rc"; then
         return "$resolver_rc"
     fi
     resolver_rc=0
     go_build_cache=$(mole_go_cache_root GOCACHE) || resolver_rc=$?
-    if mole_rc_timeout_or_signal "$resolver_rc"; then
+    if mole_rc_timeout "$resolver_rc"; then
+        debug_log "Skipping Go caches: go env GOCACHE timed out"
+        return 0
+    elif mole_rc_timeout_or_signal "$resolver_rc"; then
         return "$resolver_rc"
     fi
 
@@ -1364,6 +1396,8 @@ check_android_ndk() {
 }
 
 clean_xcode_documentation_cache() {
+    # Honor the command-wide choice before scanning or requesting credentials.
+    [[ "${SYSTEM_CLEAN:-true}" == "true" ]] || return 0
     local doc_cache_root="${MOLE_XCODE_DOCUMENTATION_CACHE_DIR:-/Library/Developer/Xcode/DocumentationCache}"
     [[ -d "$doc_cache_root" ]] || return 0
 
@@ -1845,6 +1879,8 @@ clean_xcode_xctest_devices() {
 }
 
 clean_xcode_system_coresimulator_caches() {
+    # Honor the command-wide choice before scanning or requesting credentials.
+    [[ "${SYSTEM_CLEAN:-true}" == "true" ]] || return 0
     local cache_root="${MOLE_XCODE_SYSTEM_CORESIMULATOR_CACHE_DIR:-/Library/Developer/CoreSimulator/Caches}"
     [[ -d "$cache_root" ]] || return 0
 
@@ -2335,7 +2371,7 @@ clean_xcode_device_support() {
 _sim_runtime_size_kb() {
     local target_path="$1"
     local size_kb=0
-    if has_sudo_session; then
+    if [[ "${SYSTEM_CLEAN:-true}" == "true" ]] && has_sudo_session; then
         size_kb=$(run_with_timeout "$MOLE_TIMEOUT_DISK_VERIFY_SEC" sudo -n du -skP "$target_path" 2> /dev/null | command awk 'NR==1 {print $1; exit}' || echo "0")
     else
         size_kb=$(run_with_timeout "$MOLE_TIMEOUT_DISK_VERIFY_SEC" du -skP "$target_path" 2> /dev/null | command awk 'NR==1 {print $1; exit}' || echo "0")
@@ -2797,6 +2833,12 @@ clean_dev_mobile() {
                         else
                             stop_section_spinner
 
+                            if mole_rc_signal "$delete_exit_code"; then
+                                debug_log "simctl delete unavailable interrupted (exit $delete_exit_code)"
+                                _mole_record_clean_cancellation "$delete_exit_code" "Xcode unavailable simulators"
+                                return "$delete_exit_code"
+                            fi
+
                             # Analyze error and provide helpful message
                             local error_hint=""
                             if echo "$delete_output" | grep -qi "permission denied"; then
@@ -2910,6 +2952,7 @@ clean_dev_jvm() {
     ' _ "$gradle_root" "$scan_dir" > "$scan_dir/targets" 2> /dev/null < /dev/null || scan_rc=$?
     debug_timer_end "Gradle candidate listing" scan_start
     if [[ $scan_rc -ne 0 ]]; then
+        stop_section_spinner
         rm -rf "$scan_dir" # SAFE: exact mktemp-created Gradle scan scratch directory
         debug_log "Gradle candidate listing incomplete (status $scan_rc); targets kept"
         [[ $scan_rc -lt 128 ]] || return "$scan_rc"
@@ -2927,6 +2970,7 @@ clean_dev_jvm() {
                 debug_log "Gradle build cache filtering exceeded its budget; build cache targets kept"
                 break
             fi
+            stop_section_spinner
             rm -rf "$scan_dir" # SAFE: exact mktemp-created Gradle scan scratch directory
             debug_log "Gradle candidate filtering exceeded its budget; targets kept"
             return 0
@@ -2944,6 +2988,9 @@ clean_dev_jvm() {
             *) daemon_targets+=("$target") ;;
         esac
     done < "$scan_dir/targets"
+    # The scan spinner ends with the scan, before any deferral, warning row,
+    # or cleanup output.
+    stop_section_spinner
     rm -rf "$scan_dir" # SAFE: exact mktemp-created Gradle scan scratch directory
     debug_log "Gradle eligible targets: build=${#build_targets[@]}, notifications=${#notification_targets[@]}, daemon/workers=${#daemon_targets[@]}"
     if [[ $((${#build_targets[@]} + ${#notification_targets[@]} + ${#daemon_targets[@]})) -gt 0 ]]; then
@@ -3667,9 +3714,10 @@ clean_claude_desktop_bundled_versions() {
 
     local sdk_version=""
     sdk_version=$(claude_desktop_sdk_version "$claude_support" || true)
+    # Unknown active version keeps every bundled version. That is a routine
+    # skip with nothing for the user to do, so it stays out of the summary.
     if [[ -z "$sdk_version" ]]; then
-        note_activity
-        echo -e "  ${GRAY}${ICON_WARNING}${NC} Claude Desktop bundled Claude Code · skipped (active version unknown)"
+        debug_log "Claude Desktop bundled Claude Code kept: active version unknown"
         return 0
     fi
 
@@ -3680,8 +3728,7 @@ clean_claude_desktop_bundled_versions() {
 
         local active_entry="$versions_root/$sdk_version"
         if [[ -L "$active_entry" || (! -f "$active_entry" && ! -d "$active_entry") ]]; then
-            note_activity
-            echo -e "  ${GRAY}${ICON_WARNING}${NC} $label · skipped (active version unknown)"
+            debug_log "$label kept: active version $sdk_version not found in $versions_root"
             return 0
         fi
     done
@@ -3944,18 +3991,18 @@ clean_dev_ai_agents() {
             _resolve_versioned_agent_active_path "$versions_root" "$active_symlink" || active_status=$?
             if [[ $active_status -ne 0 ]]; then
                 mole_rc_timeout_or_signal "$active_status" && return "$active_status"
+                # Without the active version every entry is kept; the reason
+                # belongs in --debug, not in the summary.
                 if [[ ! -e "$active_symlink" ]]; then
-                    echo -e "  ${GRAY}${ICON_WARNING}${NC} $label · skipped (active symlink broken)"
+                    debug_log "$label kept: active symlink broken"
                 else
-                    echo -e "  ${GRAY}${ICON_WARNING}${NC} $label · skipped (active version unknown)"
+                    debug_log "$label kept: active version unknown"
                 fi
-                note_activity
                 continue
             fi
             active_path="$_MOLE_VERSIONED_AGENT_ACTIVE_PATH"
             if [[ -z "$active_path" ]]; then
-                echo -e "  ${GRAY}${ICON_WARNING}${NC} $label · skipped (active symlink broken)"
-                note_activity
+                debug_log "$label kept: active symlink broken"
                 continue
             fi
         fi
@@ -3988,7 +4035,8 @@ clean_dev_other_langs() {
 clean_dev_cicd() {
     safe_clean ~/.cache/terraform/* "Terraform cache"
     safe_clean ~/.grafana/cache/* "Grafana cache"
-    safe_clean ~/.prometheus/data/wal/* "Prometheus WAL cache"
+    # Prometheus WAL holds committed samples needed after an unclean exit.
+    # No open writer does not mean those samples have reached a data block.
     safe_clean ~/.jenkins/workspace/*/target/* "Jenkins workspace cache"
     safe_clean ~/.cache/gitlab-runner/* "GitLab Runner cache"
     safe_clean ~/.github/cache/* "GitHub Actions cache"
@@ -5332,12 +5380,9 @@ clean_dev_misc() {
 }
 # Shell and VCS leftovers.
 clean_dev_shell() {
-    safe_clean ~/.gitconfig.lock "Git config lock"
-    safe_clean ~/.gitconfig.bak* "Git config backup"
+    # Git owns its transaction lock; config and history backups can be the
+    # only remaining copy of user state. Neither is an automatic cache target.
     safe_clean ~/.oh-my-zsh/cache/* "Oh My Zsh cache"
-    safe_clean ~/.config/fish/fish_history.bak* "Fish shell backup"
-    safe_clean ~/.bash_history.bak* "Bash history backup"
-    safe_clean ~/.zsh_history.bak* "Zsh history backup"
     safe_clean ~/.cache/pre-commit/* "pre-commit cache"
 }
 # Network tool caches.
@@ -5381,12 +5426,13 @@ _run_developer_cleanup_step() {
     "$@" || step_rc=$?
     debug_timer_end "developer cleanup step: $step_name" _perf_step_start
     if mole_rc_timeout_or_signal "$step_rc"; then
-        _mole_record_clean_cancellation "$step_rc"
+        _mole_record_clean_cancellation "$step_rc" "$step_name"
         return "$step_rc"
     fi
 
     pending_clean_cancel="${MOLE_CLEAN_CANCEL_STATUS:-0}"
     if mole_rc_timeout_or_signal "$pending_clean_cancel"; then
+        _mole_note_clean_cancel_source "$step_name"
         return "$pending_clean_cancel"
     fi
     [[ "$strict" == "true" && $step_rc -ne 0 ]] && return "$step_rc"

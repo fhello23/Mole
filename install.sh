@@ -991,7 +991,7 @@ get_installed_version() {
         if [[ -n "$version" ]]; then
             echo "$version"
         else
-            sed -n 's/^VERSION="\(.*\)"$/\1/p' "$binary" | head -n1
+            LC_ALL=C sed -n 's/^VERSION="\(.*\)"$/\1/p' "$binary" | head -n1
         fi
     fi
 }
@@ -1492,7 +1492,20 @@ install_files() {
     if [[ "$source_dir_abs" != "$install_dir_abs" ]]; then
         # Use absolute /usr/bin/sed (always BSD on macOS) so PATH-shadowed
         # GNU sed from Homebrew gnu-sed does not break the -i '' syntax.
-        if ! maybe_sudo /usr/bin/sed -i '' "s|SCRIPT_DIR=.*|SCRIPT_DIR=\"$CONFIG_DIR\"|" "$INSTALL_DIR/mole"; then
+        # Serialize a literal Bash word first, then escape the sed replacement.
+        # Config paths may contain shell syntax or sed delimiters as data.
+        # The C locale makes bash 3.2 %q escape every non-ASCII byte as octal;
+        # in a UTF-8 locale it leaves lead bytes raw and escapes only some
+        # continuation bytes, so the pinned line is not valid UTF-8.
+        local config_word config_replacement
+        config_word=$(
+            export LC_ALL=C
+            printf '%q' "$config_dir_abs"
+        )
+        config_replacement=${config_word//\\/\\\\}
+        config_replacement=${config_replacement//&/\\&}
+        config_replacement=${config_replacement//|/\\|}
+        if ! maybe_sudo /usr/bin/sed -i '' "s|^SCRIPT_DIR=.*|SCRIPT_DIR=$config_replacement|" "$INSTALL_DIR/mole"; then
             log_error "Failed to point $INSTALL_DIR/mole at $CONFIG_DIR"
             return 1
         fi

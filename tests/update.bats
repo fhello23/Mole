@@ -926,6 +926,30 @@ EOF
 	grep -q '^upgrade mole$' "$brew_log"
 }
 
+@test "mo update --nightly sends Homebrew installs to the formula's main build" {
+	local fake_brew_bin="$TEST_ROOT/homebrew/bin"
+	local fake_brew_mole="$TEST_ROOT/homebrew/Cellar/mole/9.9.9/bin/mole"
+	local brew_log="$TEST_ROOT/brew.log"
+
+	make_homebrew_shadow "$fake_brew_bin" "$fake_brew_mole"
+	: > "$brew_log"
+
+	run env \
+		HOME="$HOME" \
+		PATH="$fake_brew_bin:/usr/bin:/bin" \
+		BREW_LOG="$brew_log" \
+		"$fake_brew_bin/mo" update --nightly
+
+	[ "$status" -eq 1 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"brew install --HEAD mole"* ]] || { echo "$output"; return 1; }
+	# The script install refuses while Homebrew owns mole.
+	[[ "$output" != *"via script"* ]] || { echo "$output"; return 1; }
+	if grep -q '^upgrade' "$brew_log"; then
+		cat "$brew_log"
+		return 1
+	fi
+}
+
 @test "Homebrew update bounds fallback installed-binary version probes" {
 	run env HOME="$HOME/bounded-homebrew-version" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
@@ -1877,4 +1901,445 @@ INNER
 	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
 	[[ "$output" == *"stable"* ]] || { echo "got: $output"; return 1; }
 	[[ "$output" != *"nightly"* ]] || { echo "got: $output"; return 1; }
+}
+
+@test "stable fallback resolves a published release redirect instead of main" {
+ run /bin/bash <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/manage/update.sh"
+curl() { printf 'https://github.com/tw93/Mole/releases/tag/V9.8.7\n'; }
+[[ "$(get_latest_version)" == 9.8.7 ]] || exit 1
+SCRIPT
+ [ "$status" -eq 0 ]
+}
+
+@test "Homebrew notification reads the published formula rather than local metadata" {
+ run /bin/bash <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/manage/update.sh"
+curl() { printf '{"versions":{"stable":"9.8.7","head":"HEAD"}}\n'; }
+brew() { echo 'mole: stable 1.0.0'; }
+[[ "$(get_homebrew_latest_version)" == 9.8.7 ]] || exit 1
+SCRIPT
+ [ "$status" -eq 0 ]
+}
+
+@test "background update preserves a known notice when lookup is unknown" {
+ run /bin/bash <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/manage/update.sh"
+VERSION=1.0.0
+mkdir -p "$HOME/.cache/mole"
+printf 'Update 9.8.7 available\n' > "$HOME/.cache/mole/update_message"
+get_install_channel() { echo stable; }
+is_homebrew_install() { return 1; }
+get_latest_version_from_github() { echo ''; }
+get_latest_version() { echo ''; }
+check_for_updates
+sleep 1
+[[ "$(cat "$HOME/.cache/mole/update_message")" == 'Update 9.8.7 available' ]] || exit 1
+SCRIPT
+ [ "$status" -eq 0 ]
+}
+
+@test "background update throttles successful probes and notices survive a cached check" {
+ run /bin/bash <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/manage/update.sh"
+VERSION=1.0.0
+get_install_channel() { echo stable; }
+is_homebrew_install() { return 1; }
+get_latest_version_from_github() { echo call >> "$HOME/calls"; echo 9.8.7; }
+check_for_updates
+sleep 1
+check_for_updates
+sleep 1
+[[ "$(wc -l < "$HOME/calls" | tr -d ' ')" == 1 ]] || exit 1
+[[ "$(cat "$HOME/.cache/mole/update_message")" == *9.8.7* ]] || exit 1
+SCRIPT
+ [ "$status" -eq 0 ]
+}
+
+@test "main menu refreshes a notice arriving after its first draw" {
+ run /bin/bash <<'SCRIPT'
+set -euo pipefail
+export MOLE_TEST_MODE=1 MOLE_SKIP_MAIN=1
+source "$PROJECT_ROOT/mole"
+mkdir -p "$HOME/.cache/mole"
+hide_cursor() { :; }; show_cursor() { :; }; drain_pending_input() { :; }
+show_main_menu() { echo "visible=${MAIN_MENU_SHOW_UPDATE}"; }
+read_key() {
+ if [[ ! -f "$HOME/first" ]]; then
+  touch "$HOME/first"
+  printf 'Update 9.8.7 available\n' > "$HOME/.cache/mole/update_message"
+  echo DOWN
+ else echo QUIT
+ fi
+}
+interactive_main_menu
+SCRIPT
+ [ "$status" -eq 0 ]
+ [[ "$output" == *visible=false* ]] || return 1
+ [[ "$output" == *visible=true* ]] || return 1
+}
+
+@test "update shortcut remains visible alongside Touch ID setup" {
+ run /bin/bash <<'SCRIPT'
+set -euo pipefail
+export MOLE_TEST_MODE=1 MOLE_SKIP_MAIN=1
+source "$PROJECT_ROOT/mole"
+_main_menu_controls_line false true
+SCRIPT
+ [ "$status" -eq 0 ]
+ [[ "$output" == *'T TouchID'* ]] || return 1
+ [[ "$output" == *'U Update'* ]] || return 1
+}
+
+@test "notification retry expires after an hour and version changes bypass the daily cache" {
+ run /bin/bash <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/manage/update.sh"
+VERSION=1.0.0
+CLOCK=100000
+ANSWER=''
+date() { echo "$CLOCK"; }
+get_install_channel() { echo stable; }
+is_homebrew_install() { return 1; }
+get_latest_version_from_github() { echo call >> "$HOME/calls"; echo "$ANSWER"; }
+get_latest_version() { echo ''; }
+check_for_updates
+sleep 1
+CLOCK=100100
+check_for_updates
+sleep 1
+[[ "$(wc -l < "$HOME/calls" | tr -d ' ')" == 1 ]] || exit 1
+CLOCK=103601
+ANSWER=9.8.7
+check_for_updates
+sleep 1
+[[ "$(wc -l < "$HOME/calls" | tr -d ' ')" == 2 ]] || exit 1
+[[ "$(cat "$HOME/.cache/mole/update_message")" == *9.8.7* ]] || exit 1
+VERSION=9.8.7
+check_for_updates
+sleep 1
+[[ "$(wc -l < "$HOME/calls" | tr -d ' ')" == 3 ]] || exit 1
+[[ ! -s "$HOME/.cache/mole/update_message" ]] || exit 1
+CLOCK=190002
+ANSWER=9.9.0
+check_for_updates
+sleep 1
+[[ "$(wc -l < "$HOME/calls" | tr -d ' ')" == 4 ]] || exit 1
+[[ "$(cat "$HOME/.cache/mole/update_message")" == *9.9.0* ]] || exit 1
+SCRIPT
+ [ "$status" -eq 0 ]
+}
+
+@test "Homebrew background notification works while GitHub is unavailable" {
+ run /bin/bash <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/manage/update.sh"
+VERSION=1.0.0
+get_install_channel() { echo stable; }
+is_homebrew_install() { return 0; }
+get_latest_version_from_github() { touch "$HOME/wrong-provider"; echo ''; }
+get_homebrew_latest_version() { echo 9.8.7; }
+check_for_updates
+sleep 1
+[[ ! -e "$HOME/wrong-provider" ]] || exit 1
+[[ "$(cat "$HOME/.cache/mole/update_message")" == *9.8.7* ]] || exit 1
+SCRIPT
+ [ "$status" -eq 0 ]
+}
+
+@test "stable discovery rejects unpublished redirects and invalid API versions" {
+ run /bin/bash <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/manage/update.sh"
+curl() { echo 'https://raw.githubusercontent.com/tw93/mole/main/mole'; }
+[[ -z "$(get_latest_version)" ]] || exit 1
+curl() { echo '{"tag_name":"V1.60.0-beta.1"}'; }
+[[ -z "$(get_latest_version_from_github)" ]] || exit 1
+curl() { echo '{"tag_name":"V1.59.1"}'; }
+[[ "$(get_latest_version_from_github)" == 1.59.1 ]] || exit 1
+SCRIPT
+ [ "$status" -eq 0 ]
+}
+
+@test "update check stays silent when the cache cannot be written or read" {
+ [ "$(id -u)" -ne 0 ] || skip "root ignores directory and file modes"
+ run /bin/bash <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/manage/update.sh"
+VERSION=1.0.0
+get_install_channel() { echo stable; }
+is_homebrew_install() { return 1; }
+get_latest_version_from_github() { echo ''; }
+get_latest_version() { echo ''; }
+cache="$HOME/.cache/mole"
+mkdir -p "$cache"
+
+# Read-only cache directory: the atomic write cannot create its scratch file.
+chmod 555 "$cache"
+mktemp "$cache/probe.XXXXXX" 2> "$HOME/control-dir" && exit 1
+[[ -s "$HOME/control-dir" ]] || exit 1
+check_for_updates 2> "$HOME/stderr-dir"
+chmod 755 "$cache"
+
+# Unreadable throttle file: the read redirection fails.
+printf 'x 1 86400\n' > "$cache/version_check"
+chmod 000 "$cache/version_check"
+{ read -r a b c < "$cache/version_check"; } 2> "$HOME/control-file" && exit 1
+[[ -s "$HOME/control-file" ]] || exit 1
+check_for_updates 2> "$HOME/stderr-file"
+sleep 1
+[[ ! -s "$HOME/stderr-dir" && ! -s "$HOME/stderr-file" ]] || { cat "$HOME/stderr-dir" "$HOME/stderr-file"; exit 1; }
+SCRIPT
+ [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "update check stays silent when the install receipt is unreadable" {
+ [ "$(id -u)" -ne 0 ] || skip "root ignores file modes"
+ run /bin/bash <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/manage/update.sh"
+VERSION=1.0.0
+is_homebrew_install() { return 1; }
+get_latest_version_from_github() { echo ''; }
+get_latest_version() { echo ''; }
+SCRIPT_DIR="$HOME/no-install"
+mkdir -p "$HOME/.config/mole"
+printf 'CHANNEL=stable\nCOMMIT_HASH=abc\n' > "$HOME/.config/mole/install_channel"
+chmod 000 "$HOME/.config/mole/install_channel"
+# Control: the receipt probes do print when nothing silences them.
+get_install_channel > /dev/null 2> "$HOME/control" || true
+[[ -s "$HOME/control" ]] || exit 1
+check_for_updates 2> "$HOME/stderr"
+sleep 1
+[[ ! -s "$HOME/stderr" ]] || { cat "$HOME/stderr"; exit 1; }
+SCRIPT
+ chmod 644 "$HOME/.config/mole/install_channel"
+ [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "update throttle is shared by every name that starts one install" {
+ mkdir -p "$TEST_ROOT/bin"
+ ln -s "$PROJECT_ROOT/mole" "$TEST_ROOT/bin/mole"
+ ln -s "$PROJECT_ROOT/mole" "$TEST_ROOT/bin/mo-alias"
+ run /bin/bash <<'SCRIPT'
+set -euo pipefail
+probe() {
+ /bin/bash --noprofile --norc -c '
+export MOLE_TEST_MODE=1 MOLE_SKIP_MAIN=1
+source "$1"
+[[ -z "${2:-}" ]] || SCRIPT_DIR="$2"
+VERSION=1.0.0
+get_install_channel() { echo stable; }
+is_homebrew_install() { return 1; }
+get_latest_version_from_github() { echo call >> "$HOME/calls"; echo 9.8.7; }
+check_for_updates
+sleep 1
+' _ "$@"
+}
+calls() { wc -l < "$HOME/calls" | tr -d ' '; }
+probe "$TEST_ROOT/bin/mole"
+[[ "$(calls)" == 1 ]] || exit 1
+# The same install under another name reuses the daily result and its notice.
+probe "$TEST_ROOT/bin/mo-alias"
+[[ "$(calls)" == 1 ]] || { echo "lookups after switching names: $(calls)"; exit 1; }
+[[ "$(cat "$HOME/.cache/mole/update_message")" == *9.8.7* ]] || exit 1
+# Control: a different install directory still looks up on its own.
+probe "$TEST_ROOT/bin/mole" "$TEST_ROOT/other-install"
+[[ "$(calls)" == 2 ]] || { echo "lookups for another install: $(calls)"; exit 1; }
+SCRIPT
+ [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "a leftover notice for the running version is not shown after an upgrade" {
+ run /bin/bash <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/manage/update.sh"
+mkdir -p "$HOME/.cache/mole"
+msg="$HOME/.cache/mole/update_message"
+VERSION=1.59.0
+# V1.58.x wrote the notice with a leading newline and a colored command; a
+# package manager upgrade leaves it in place with its old mtime.
+printf '\nUpdate 1.59.0 available, run %smo update%s\n\n' "$GREEN" "$NC" > "$msg"
+[[ -z "$(read_update_message_cache "$msg")" ]] || exit 1
+printf 'Update 1.58.0 available, run mo update\n' > "$msg"
+[[ -z "$(read_update_message_cache "$msg")" ]] || exit 1
+# Controls: newer releases and nightly notices are still shown, and versions
+# compare numerically rather than as text.
+printf 'Update 1.59.1 available, run mo update\n' > "$msg"
+[[ "$(read_update_message_cache "$msg")" == 'Update 1.59.1 available, run mo update' ]] || exit 1
+printf 'Update 1.100.0 available, run mo update\n' > "$msg"
+[[ "$(read_update_message_cache "$msg")" == *1.100.0* ]] || exit 1
+printf 'New nightly commit abc1234 available, run mo update --nightly\n' > "$msg"
+[[ "$(read_update_message_cache "$msg")" == *abc1234* ]] || exit 1
+# The first check after the upgrade has no version_check yet and its lookup is
+# still in flight, so the stale text must already be hidden when it returns.
+printf 'Update 1.59.0 available, run mo update\n' > "$msg"
+get_install_channel() { echo stable; }
+is_homebrew_install() { return 1; }
+get_latest_version_from_github() {
+ for _ in $(seq 1 100); do [[ -e "$HOME/release-lookup" ]] && break; sleep 0.1; done
+ echo 1.59.0
+}
+check_for_updates
+[[ -z "$(read_update_message_cache "$msg")" ]] || exit 1
+touch "$HOME/release-lookup"
+sleep 1
+SCRIPT
+ [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "nightly background check reports a new commit, clears a current one and keeps the notice when unknown" {
+ run /bin/bash <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/manage/update.sh"
+VERSION=1.0.0
+CLOCK=100000
+INSTALLED=aaaaaaa1111111111111111111111111111111aa
+LATEST=bbbbbbb2222222222222222222222222222222bb
+date() { echo "$CLOCK"; }
+get_install_channel() { echo nightly; }
+get_install_commit() { echo "$INSTALLED"; }
+get_latest_commit_from_github() { echo "$LATEST"; }
+msg="$HOME/.cache/mole/update_message"
+# Each step starts more than a day after the previous one so the daily
+# throttle never hides a lookup.
+check_for_updates
+sleep 1
+[[ "$(cat "$msg")" == 'New nightly commit bbbbbbb available, run mo update --nightly' ]] || { echo "new commit: $(cat "$msg")"; exit 1; }
+CLOCK=190000
+LATEST=$INSTALLED
+check_for_updates
+sleep 1
+[[ ! -s "$msg" ]] || { echo "current commit: $(cat "$msg")"; exit 1; }
+CLOCK=280000
+LATEST=ccccccc3333333333333333333333333333333cc
+check_for_updates
+sleep 1
+[[ "$(cat "$msg")" == *ccccccc* ]] || { echo "second commit: $(cat "$msg")"; exit 1; }
+CLOCK=370000
+LATEST=''
+check_for_updates
+sleep 1
+[[ "$(cat "$msg")" == *ccccccc* ]] || { echo "unknown lookup: $(cat "$msg")"; exit 1; }
+SCRIPT
+ [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "a changed install key clears the stored notice even when the lookup is unknown" {
+ run /bin/bash <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/manage/update.sh"
+VERSION=1.0.0
+CLOCK=200000
+date() { echo "$CLOCK"; }
+get_install_channel() { echo stable; }
+is_homebrew_install() { return 1; }
+get_latest_version_from_github() { echo ''; }
+get_latest_version() { echo ''; }
+cache="$HOME/.cache/mole"
+msg="$cache/update_message"
+mkdir -p "$cache"
+printf 'Update 9.8.7 available, run mo update' > "$msg"
+# A throttle record from another install, version or channel: its key differs.
+printf '1 199000 86400\n' > "$cache/version_check"
+check_for_updates
+# Cleared before the lookup runs, and the unknown result cannot bring it back.
+[[ ! -s "$msg" ]] || { echo "notice survived a key change: $(cat "$msg")"; exit 1; }
+sleep 1
+[[ ! -s "$msg" ]] || exit 1
+# Control: with an unchanged key an unknown lookup keeps a known notice.
+printf 'Update 9.8.7 available, run mo update' > "$msg"
+CLOCK=204000
+check_for_updates
+sleep 1
+[[ -s "$msg" ]] || { echo "notice lost without a key change"; exit 1; }
+SCRIPT
+ [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "run_mole_command keeps its stderr redirect off the wait builtin" {
+	# On bash 3.2 a TERM or HUP trap followed within a fraction of a millisecond
+	# by INT can leave a redirected wait looping at full CPU, so the redirect that
+	# hides the job-status line of a signaled child sits on a group instead.
+	local code waits
+	code=$(grep -v '^[[:space:]]*#' "$PROJECT_ROOT/lib/manage/update.sh")
+	# shellcheck disable=SC2016  # Literal source text, not an expansion.
+	waits=$(printf '%s\n' "$code" | grep -cF 'wait "$command_pid"' || true)
+	# Positive control: exactly one wait must be found, or the checks below pass vacuously.
+	[ "$waits" -eq 1 ] || { echo "expected one wait on command_pid, found $waits"; return 1; }
+	# shellcheck disable=SC2016  # Literal source text, not an expansion.
+	printf '%s\n' "$code" | grep -qF '{ wait "$command_pid"; } 2> /dev/null' || { echo "wait redirect is not on a group"; return 1; }
+	# shellcheck disable=SC2016  # Literal source text, not an expansion.
+	! printf '%s\n' "$code" | grep -qF 'wait "$command_pid" 2>' || { echo "wait builtin carries a redirect"; return 1; }
+}
+
+@test "Nix detection uses only the invoked install's resolved store root" {
+    run /bin/bash <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/manage/update.sh"
+SCRIPT_DIR=/nix/store/0123456789-mole-1.59.0/share/mole
+is_nix_install || exit 1
+for SCRIPT_DIR in "$HOME/nix/store/mole" /nix/store-backup/mole /opt/homebrew/Cellar/mole/1.59.0 "$PROJECT_ROOT" ''; do
+    if is_nix_install; then exit 1; fi
+done
+SCRIPT
+    [ "$status" -eq 0 ]
+}
+
+@test "Nix update refuses before download or authorization for stable and nightly" {
+    for args in 'false false' 'true false' 'false true'; do
+        run env UPDATE_ARGS="$args" /bin/bash <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/manage/update.sh"
+SCRIPT_DIR=/nix/store/0123456789-mole/share/mole
+curl() { touch "$HOME/download-called"; return 97; }
+ensure_sudo_session() { touch "$HOME/auth-called"; return 97; }
+# Deliberate splitting of this fixed pair of boolean fixture arguments.
+update_mole $UPDATE_ARGS
+SCRIPT
+        [ "$status" -eq 1 ] || { echo "$output"; return 1; }
+        [[ "$output" == *'nix profile upgrade mole'* ]] || return 1
+        [ ! -e "$HOME/download-called" ] || return 1
+        [ ! -e "$HOME/auth-called" ] || return 1
+    done
+}
+
+@test "Nix hides update notices without changing another install's shared cache" {
+    run /bin/bash <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/manage/update.sh"
+VERSION=1.59.0
+mkdir -p "$HOME/.cache/mole"
+notice="$HOME/.cache/mole/update_message"
+printf '%s\n' 'Update 9.9.9 available, run mo update' > "$notice"
+SCRIPT_DIR=/nix/store/0123456789-mole/share/mole
+curl() { touch "$HOME/download-called"; return 97; }
+check_for_updates
+[[ -z "$(read_update_message_cache "$notice")" ]] || exit 1
+[[ "$(cat "$notice")" == 'Update 9.9.9 available, run mo update' ]] || exit 1
+[[ ! -e "$HOME/download-called" ]] || exit 1
+[[ ! -e "$HOME/.cache/mole/version_check" ]] || exit 1
+SCRIPT_DIR="$PROJECT_ROOT"
+mole_update_message_cache_is_current() { return 0; }
+[[ "$(read_update_message_cache "$notice")" == 'Update 9.9.9 available, run mo update' ]] || exit 1
+SCRIPT
+    [ "$status" -eq 0 ]
 }

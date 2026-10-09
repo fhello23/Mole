@@ -17,6 +17,62 @@ setup() {
     source "$PROJECT_ROOT/lib/core/base.sh"
 }
 
+@test "Perl timeout backend backs off short polls and preserves command status" {
+    [[ -x /usr/bin/perl ]] || skip "Perl fallback unavailable"
+    run /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+export MO_TIMEOUT_INITIALIZED=1 MO_TIMEOUT_BIN="" MO_TIMEOUT_PERL_BIN=/usr/bin/perl
+source "$PROJECT_ROOT/lib/core/timeout.sh"
+probe_dir=$(mktemp -d "$TEST_DATA_DIR/poll.XXXXXX")
+# SAFE: exact mktemp-created test fixture, removed after the bounded probe exits.
+trap 'rm -rf "$probe_dir"' EXIT
+cat > "$probe_dir/MolePollProbe.pm" <<'PERL'
+package MolePollProbe;
+use strict;
+use warnings;
+use Time::HiRes ();
+my $real_sleep = \&Time::HiRes::sleep;
+my $polls = 0;
+{
+    no warnings 'redefine';
+    *Time::HiRes::sleep = sub (;@) {
+        open my $log, '>>', "$ENV{MOLE_POLL_FIXTURE}/intervals" or die $!;
+        print {$log} "$_[0]\n";
+        close $log or die $!;
+        # The child cannot exit before six polls, even on a busy runner.
+        if (++$polls == 6) {
+            open my $release, '>', "$ENV{MOLE_POLL_FIXTURE}/release" or die $!;
+            close $release or die $!;
+        }
+        return $real_sleep->(@_);
+    };
+}
+1;
+PERL
+export PERL5LIB="$probe_dir" PERL5OPT=-MMolePollProbe MOLE_POLL_FIXTURE="$probe_dir"
+rc=0
+# Both helper and child have a deadline, so a broken handshake cannot hang.
+run_with_timeout 10 /bin/bash --noprofile --norc -c '
+    deadline=$((SECONDS + 10))
+    while [[ ! -f "$MOLE_POLL_FIXTURE/release" ]]; do
+        [[ $SECONDS -lt $deadline ]] || exit 99
+        sleep 0.01
+    done
+    exit 7
+' < /dev/null || rc=$?
+printf 'RC=%s POLLS=%s\n' "$rc" "$(tr '\n' ',' < "$probe_dir/intervals")"
+[[ $rc -eq 7 ]] || exit 1
+awk '
+    BEGIN { split("0.01 0.02 0.04 0.08 0.1 0.1", expected) }
+    NR <= 6 && $1 != expected[NR] { bad = 1 }
+    $1 <= 0 || $1 > 0.1 { bad = 1 }
+    END { exit (bad || NR < 6) }
+' "$probe_dir/intervals"
+EOF
+    [ "$status" -eq 0 ] || { printf '%s\n' "$output"; return 1; }
+    [[ "$output" == *"RC=7 POLLS=0.01,0.02,0.04,0.08,0.1,0.1,"* ]]
+}
+
 @test "scan workers reap a completed peer before a blocked queue head" {
     run /bin/bash <<'EOF'
 set -euo pipefail

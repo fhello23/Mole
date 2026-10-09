@@ -9,9 +9,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/x/ansi"
 )
@@ -78,6 +81,102 @@ func TestGetDirectorySizeFromDuSkippingImmediateChildDoesNotMeasureExcludedPath(
 	}
 	if len(measured) != 1 || measured[0] != included {
 		t.Fatalf("expected to measure only %s, measured %#v", included, measured)
+	}
+}
+
+func TestGetDirectorySizeFromDuMeasuresUserLibraryInOneTraversal(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	library := filepath.Join(home, "Library")
+	writeFileWithSize(t, filepath.Join(library, "Application Support", "state.dat"), 4096)
+	writeFileWithSize(t, filepath.Join(library, "Caches", "cache.dat"), 8192)
+	writeFileWithSize(t, filepath.Join(library, "Containers", "app", "Mobile Documents", "nested.dat"), 4*1024*1024)
+	writeFileWithSize(t, filepath.Join(library, "Mobile Documents", "cloud.dat"), 4*1024*1024)
+	writeFileWithSize(t, filepath.Join(library, "top.plist"), 100)
+
+	binDir := t.TempDir()
+	operandLog := filepath.Join(binDir, "du-operands")
+	stub := "#!/bin/sh\n" +
+		"for operand; do :; done\n" +
+		"printf '%s\\n' \"$operand\" >> \"$MOLE_TEST_DU_OPERANDS\"\n" +
+		"exec /usr/bin/du \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(binDir, "du"), []byte(stub), 0o755); err != nil {
+		t.Fatalf("write du stub: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("MOLE_TEST_DU_OPERANDS", operandLog)
+
+	size, err := getDirectorySizeFromDuWithExcludeAndIgnores(context.Background(), library, "", overviewIgnoreNamesForPath(library))
+	if err != nil {
+		t.Fatalf("getDirectorySizeFromDuWithExcludeAndIgnores: %v", err)
+	}
+	if size < 4096+8192 {
+		t.Fatalf("expected sibling sizes to be summed, got %d", size)
+	}
+	if size >= 1024*1024 {
+		t.Fatalf("expected both Mobile Documents trees to be ignored, got %d", size)
+	}
+
+	data, err := os.ReadFile(operandLog)
+	if err != nil {
+		t.Fatalf("read du operands: %v", err)
+	}
+	got := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(got) != 1 || got[0] != library {
+		t.Fatalf("expected one Library traversal for shared hardlink accounting, got %q", got)
+	}
+}
+
+func TestOverviewPerChildDuPoolBelongsToOneMeasurement(t *testing.T) {
+	workers := min(max(runtime.NumCPU()*2, 2), 8)
+	stuckBase := t.TempDir()
+	for i := range workers + 2 {
+		if err := os.MkdirAll(filepath.Join(stuckBase, fmt.Sprintf("child-%d", i)), 0o755); err != nil {
+			t.Fatalf("mkdir child: %v", err)
+		}
+	}
+	freshBase := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(freshBase, "child"), 0o755); err != nil {
+		t.Fatalf("mkdir child: %v", err)
+	}
+
+	// Hold every permit of one measurement on children that never finish,
+	// the way a cancelled Home refresh can while its du processes wind down.
+	release := make(chan struct{})
+	stuckDone := make(chan struct{})
+	var started atomic.Int64
+	go func() {
+		defer close(stuckDone)
+		_, _ = getDirectorySizeFromDuSkippingImmediateChild(context.Background(), stuckBase, filepath.Join(stuckBase, "Library"), func(string) (int64, error) {
+			started.Add(1)
+			<-release
+			return 100, nil
+		})
+	}()
+	defer func() {
+		close(release)
+		<-stuckDone
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for started.Load() < int64(workers) {
+		if time.Now().After(deadline) {
+			t.Fatalf("expected %d concurrent du workers, saw %d", workers, started.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// A new measurement gets its own permits instead of queueing behind the
+	// stuck one.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var calls atomic.Int64
+	_, err := getDirectorySizeFromDuSkippingImmediateChild(ctx, freshBase, filepath.Join(freshBase, "Library"), func(string) (int64, error) {
+		calls.Add(1)
+		return 100, nil
+	})
+	if err != nil || calls.Load() != 1 {
+		t.Fatalf("a stuck measurement held this one's permits: du calls=%d err=%v", calls.Load(), err)
 	}
 }
 
@@ -354,5 +453,36 @@ func TestOverviewMeasurementStoresDenialOnlyPartial(t *testing.T) {
 	_, err = measureOverviewSize(ctx, root)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancellation lost: %v", err)
+	}
+}
+
+func TestUserLibraryOverviewDeduplicatesHardlinks(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	library := filepath.Join(home, "Library")
+	original := filepath.Join(library, "Application Support", "payload")
+	writeFileWithSize(t, original, 1024*1024)
+	for _, link := range []string{filepath.Join(library, "Caches", "payload"), filepath.Join(library, "top-link")} {
+		if err := os.MkdirAll(filepath.Dir(link), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link(original, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out, err := exec.Command("/usr/bin/du", "-skPx", library).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	kb, err := strconv.ParseInt(strings.Fields(string(out))[0], 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := getDirectorySizeFromDuWithExcludeAndIgnores(context.Background(), library, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != kb*1024 {
+		t.Fatalf("Library size = %d, single du = %d; hardlinks must count once", got, kb*1024)
 	}
 }

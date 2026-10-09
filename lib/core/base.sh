@@ -614,6 +614,75 @@ mole_filter_nested_paths() {
     return 0
 }
 
+# Lowercase ASCII letters into the variable named by $1, the same bytes
+# `LC_ALL=C tr '[:upper:]' '[:lower:]'` produces in the C and UTF-8 locales,
+# without a subprocess: hot loops call this once per candidate, and each tr
+# cost a fork. Bash 3.2 expansion skips some letters after high bytes in
+# legacy multibyte locales (GBK, SJIS, Big5), so keep callers under the
+# LC_ALL=C that bin/clean.sh exports.
+mole_ascii_lowercase() {
+    local _lowercase_value="${2:-}"
+    _lowercase_value=${_lowercase_value//A/a}
+    _lowercase_value=${_lowercase_value//B/b}
+    _lowercase_value=${_lowercase_value//C/c}
+    _lowercase_value=${_lowercase_value//D/d}
+    _lowercase_value=${_lowercase_value//E/e}
+    _lowercase_value=${_lowercase_value//F/f}
+    _lowercase_value=${_lowercase_value//G/g}
+    _lowercase_value=${_lowercase_value//H/h}
+    _lowercase_value=${_lowercase_value//I/i}
+    _lowercase_value=${_lowercase_value//J/j}
+    _lowercase_value=${_lowercase_value//K/k}
+    _lowercase_value=${_lowercase_value//L/l}
+    _lowercase_value=${_lowercase_value//M/m}
+    _lowercase_value=${_lowercase_value//N/n}
+    _lowercase_value=${_lowercase_value//O/o}
+    _lowercase_value=${_lowercase_value//P/p}
+    _lowercase_value=${_lowercase_value//Q/q}
+    _lowercase_value=${_lowercase_value//R/r}
+    _lowercase_value=${_lowercase_value//S/s}
+    _lowercase_value=${_lowercase_value//T/t}
+    _lowercase_value=${_lowercase_value//U/u}
+    _lowercase_value=${_lowercase_value//V/v}
+    _lowercase_value=${_lowercase_value//W/w}
+    _lowercase_value=${_lowercase_value//X/x}
+    _lowercase_value=${_lowercase_value//Y/y}
+    _lowercase_value=${_lowercase_value//Z/z}
+    printf -v "$1" '%s' "$_lowercase_value"
+}
+
+# Escape operation records and deletion-log fields at their write boundaries.
+# Control bytes must never create audit records or terminal controls, so each
+# one is written as \n, \r, \t or \xHH. Backslashes stay literal: a name with
+# one reads back exactly as it is on disk, as it did before this escaping.
+# Only the logged copy changes, never the action path. mo history applies it
+# again when printing text, which leaves V1.59.0 rows untouched and escapes
+# the raw control bytes older logs may still hold.
+_mole_escape_log_value() {
+    local _output="$1" _value="$2" _escaped="" _char _code _index
+    local LC_ALL=C
+    if [[ "$_value" =~ [[:cntrl:]] ]]; then
+        for ((_index = 0; _index < ${#_value}; _index++)); do
+            _char="${_value:_index:1}"
+            case "$_char" in
+                $'\n') _escaped+='\n' ;;
+                $'\r') _escaped+='\r' ;;
+                $'\t') _escaped+='\t' ;;
+                *)
+                    if [[ "$_char" =~ [[:cntrl:]] ]]; then
+                        printf -v _code '\\x%02x' "'$_char"
+                        _escaped+="$_code"
+                    else
+                        _escaped+="$_char"
+                    fi
+                    ;;
+            esac
+        done
+        _value="$_escaped"
+    fi
+    printf -v "$_output" '%s' "$_value"
+}
+
 # Wait in the owning shell so Bash 3.2 can reap any completed scan worker.
 # The first argument names a caller variable receiving the completed PID;
 # the return status belongs to that worker, or to an interrupted polling sleep.
@@ -660,8 +729,10 @@ get_optimal_parallel_jobs() {
 # User Context Utilities
 # ============================================================================
 
+# EUID answers the same question as id -u without a subprocess; clean asks
+# it for many targets.
 is_root_user() {
-    [[ "$(id -u)" == "0" ]]
+    [[ "${EUID:-$(id -u)}" == "0" ]]
 }
 
 get_invoking_uid() {
@@ -960,12 +1031,17 @@ percent_encode_path() {
 # Print a path as an OSC 8 file:// hyperlink so terminals keep it clickable
 # even when it contains spaces (auto-detection breaks on whitespace). Shows
 # the ~-abbreviated path; piped output and non-ANSI terminals get plain text.
+# An optional $2 replaces the visible text inside the link only: without a
+# link to carry the full path, plain text always shows the whole path.
 format_path_link() {
     local path="$1"
     local display="${path/#$HOME/~}"
     if ! is_ansi_supported 2> /dev/null; then
         printf '%s' "$display"
         return 0
+    fi
+    if [[ -n "${2:-}" ]]; then
+        display="$2"
     fi
     # ESC-backslash is the OSC 8 string terminator; kept in a variable since
     # a single-quoted printf format ending in \\ trips ShellCheck SC1003.
@@ -1378,9 +1454,13 @@ update_progress_if_needed() {
     local last_update_var="$3" # Name of variable holding last update time
     local interval="${4:-2}"   # Default: update every 2 seconds
 
-    # Get current time
-    local current_time
-    current_time=$(get_epoch_seconds)
+    # Get current time. Callers tick once per item, so anchor $SECONDS to the
+    # epoch once per shell instead of forking date on every call; the sum is
+    # the same epoch that callers seed the last update time with.
+    if [[ ! "${_MOLE_PROGRESS_EPOCH_BASE:-}" =~ ^[0-9]+$ ]]; then
+        _MOLE_PROGRESS_EPOCH_BASE=$(($(get_epoch_seconds) - SECONDS))
+    fi
+    local current_time=$((_MOLE_PROGRESS_EPOCH_BASE + SECONDS))
 
     # Get last update time from variable
     local last_time

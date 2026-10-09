@@ -1033,12 +1033,19 @@ paginated_multi_select() {
         esac
 
         # Drain any accumulated input after processing (e.g., mouse wheel events)
-        # This prevents buffered events from causing jumps, without blocking keyboard input
-        # Preserve pasted or quickly typed search text, including its first
-        # character immediately after '/'. Draining here loses query bytes.
-        if [[ -z "${MOLE_READ_KEY_FORCE_CHAR:-}" ]]; then
-            drain_pending_input
-        fi
+        # This prevents buffered events from causing jumps, without blocking keyboard input.
+        # Search typing is that keyboard input: a paste or fast typing arrives as
+        # one queued burst, so draining there would keep only its first character.
+        # Any other key still drains, so the unread tail of a partly decoded
+        # escape sequence (Shift+Arrow, F5) never lands in the search term.
+        case "$key" in
+            CHAR:* | SPACE | DELETE)
+                if [[ -z "${MOLE_READ_KEY_FORCE_CHAR:-}" ]]; then
+                    drain_pending_input
+                fi
+                ;;
+            *) drain_pending_input ;;
+        esac
     done
 }
 

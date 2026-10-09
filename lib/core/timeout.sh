@@ -80,6 +80,13 @@ mole_rc_timeout_or_signal() {
     [[ "${1:-0}" -eq 124 || "${1:-0}" -ge 128 ]]
 }
 
+# A mutating owner command may also exit with an errno-derived status such as
+# npm's 243, which is an ordinary failure. Only a status that names a real
+# signal means the user interrupted it; a timeout is not one.
+mole_rc_signal() {
+    [[ "${1:-0}" -ge 128 ]] && kill -l "$1" > /dev/null 2>&1
+}
+
 _mole_cleanup_timeout_killer() {
     local killer_pid="${1:-}"
     [[ "$killer_pid" =~ ^[0-9]+$ ]] || return 0
@@ -292,6 +299,9 @@ run_with_timeout() {
             };
 
             my $deadline = time() + $duration;
+            # Short metadata probes should not each pay a 100ms polling wait.
+            # Back off to the existing cadence for long-running commands.
+            my $poll_interval = 0.01;
 
             while (1) {
                 my $result = waitpid($pid, WNOHANG);
@@ -323,7 +333,9 @@ run_with_timeout() {
                     exit 124;
                 }
 
-                sleep 0.1;
+                sleep $poll_interval;
+                $poll_interval *= 2;
+                $poll_interval = 0.1 if $poll_interval > 0.1;
             }
         ' "$duration" "$@"
         return $?

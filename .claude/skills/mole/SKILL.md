@@ -57,10 +57,17 @@ Go flag parser stops at the first positional argument.
 
 **Cleanup history.** `mo history --json [--limit N]` (N is 1-200) prints
 `logs` (paths of the operations and deletions logs), `limit`, `sessions[]` with
-`command`, `started_at`, `ended_at`, `items`, `size`, `operation_count`,
-`failed_tasks`, and an `actions` breakdown of removed / trashed / skipped /
-failed / rebuilt / other, plus a structured `deletions[]` array of the logged
-paths. This is how you answer "did Mole delete my file" without guessing.
+`command`, `run_id`, `attribution`, `started_at`, `ended_at`, `items`, `size`,
+`operation_count`, `failed_tasks`, and an `actions` breakdown of removed /
+trashed / skipped / failed / rebuilt / other, plus a structured `deletions[]`
+array of the logged `timestamp`, `mode`, `status`, `size_kb`, and `path`.
+`run_id` is an opaque string, empty when no identity was logged. `attribution`
+is `run` for an identified run, `command` for older command-based grouping, or
+`ambiguous` when older markers cannot tell an interrupted run from overlapping
+ones, in which case the counts cannot be assigned to a single run. An empty
+`ended_at` means no end marker was recorded. A logged path reads as it is on
+disk, except that control bytes appear as `\n`, `\r`, `\t`, or `\xHH`. This is
+how you answer "did Mole delete my file" without guessing.
 
 **Installed apps.** `mo uninstall --list` piped (stdout not a TTY) prints the
 app inventory as JSON: name, bundle id, uninstall name, path, size. This is how

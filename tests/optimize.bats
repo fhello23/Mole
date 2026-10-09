@@ -115,7 +115,119 @@ EOF
 
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"DNS cache refreshed"* ]] || return 1
-	[[ "$output" == *"mDNSResponder restarted"* ]]
+	[[ "$output" != *"mDNSResponder"* ]]
+}
+
+@test "DNS flush is skipped in both optimize tasks while a VPN is active" {
+	# run_with_timeout execs a binary, so a shell-function mdutil is never
+	# reached and the real Spotlight probe would decide failed vs skipped.
+	mole_test_fake_command mdutil 'echo "Indexing enabled."'
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_ASSUME_VPN_ACTIVE=1 MOLE_OPTIMIZE_SUDO_AVAILABLE=true MOLE_DRY_RUN=0 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+unset MOLE_TEST_NO_AUTH MOLE_TEST_MODE
+sudo() { echo "UNEXPECTED_SUDO:$*"; return 0; }
+
+execute_optimization system_maintenance
+execute_optimization network_optimization
+[[ "$(optimize_outcome_count skipped)" == "2" ]] || exit 1
+[[ "$(optimize_outcome_count applied)" == "0" ]] || exit 1
+[[ "$(optimize_outcome_count failed)" == "0" ]] || exit 1
+[[ "${MOLE_DNS_FLUSHED:-0}" == "0" ]] || exit 1
+EOF
+
+	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"DNS cache flush skipped, active VPN detected"* ]] || return 1
+	[[ "$output" == *"DNS cache refresh skipped, active VPN detected"* ]] || return 1
+	[[ "$output" != *"UNEXPECTED_SUDO"* ]] || return 1
+	[[ "$output" != *"already refreshed"* ]]
+}
+
+@test "dry-run previews the VPN skip instead of a DNS flush" {
+	mole_test_fake_command mdutil 'echo "Indexing enabled."'
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_ASSUME_VPN_ACTIVE=1 MOLE_DRY_RUN=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+
+execute_optimization system_maintenance
+execute_optimization network_optimization
+[[ "$(optimize_outcome_count skipped)" == "2" ]] || exit 1
+EOF
+
+	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"DNS cache flush skipped, active VPN detected"* ]] || return 1
+	[[ "$output" != *"DNS cache flushed"* ]] || return 1
+	[[ "$output" != *"DNS cache refreshed"* ]]
+}
+
+@test "DNS flush runs once without a VPN and the second task reports it unchanged" {
+	mole_test_fake_command mdutil 'echo "Indexing enabled."'
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_ASSUME_VPN_ACTIVE=0 MOLE_OPTIMIZE_SUDO_AVAILABLE=true MOLE_DRY_RUN=0 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+unset MOLE_TEST_NO_AUTH MOLE_TEST_MODE
+sudo() { echo "SUDO:$*"; return 0; }
+
+execute_optimization system_maintenance
+execute_optimization network_optimization
+[[ "$(optimize_outcome_count applied)" == "1" ]] || exit 1
+[[ "$(optimize_outcome_count unchanged)" == "1" ]] || exit 1
+EOF
+
+	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"SUDO:dscacheutil -flushcache"* ]] || return 1
+	[[ "$output" == *"SUDO:killall -HUP mDNSResponder"* ]] || return 1
+	[[ "$(grep -c 'SUDO:dscacheutil -flushcache' <<< "$output")" == "1" ]] || return 1
+	[[ "$output" == *"DNS cache flushed"* ]] || return 1
+	[[ "$output" == *"DNS cache already refreshed"* ]] || return 1
+	[[ "$output" != *"Failed to refresh DNS cache"* ]] || return 1
+	[[ "$output" != *"restarted"* ]]
+}
+
+@test "DNS flush fails closed when the VPN state cannot be determined" {
+	mole_test_fake_command mdutil 'echo "Indexing enabled."'
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_OPTIMIZE_SUDO_AVAILABLE=true MOLE_DRY_RUN=0 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+unset MOLE_TEST_NO_AUTH MOLE_TEST_MODE MOLE_ASSUME_VPN_ACTIVE
+has_active_vpn_interface() { return 2; }
+sudo() { echo "UNEXPECTED_SUDO:$*"; return 0; }
+
+execute_optimization system_maintenance
+execute_optimization network_optimization
+[[ "$(optimize_outcome_count failed)" == "2" ]] || exit 1
+[[ "$(optimize_outcome_count applied)" == "0" ]] || exit 1
+EOF
+
+	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
+	[[ "$(grep -c 'Failed to inspect active VPN state' <<< "$output")" == "2" ]] || return 1
+	[[ "$output" != *"UNEXPECTED_SUDO"* ]]
+}
+
+@test "a failed DNS flush is named by both optimize tasks that attempt it" {
+	mole_test_fake_command mdutil 'echo "Indexing enabled."'
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_ASSUME_VPN_ACTIVE=0 MOLE_OPTIMIZE_SUDO_AVAILABLE=true MOLE_DRY_RUN=0 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+unset MOLE_TEST_NO_AUTH MOLE_TEST_MODE
+sudo() { echo "SUDO_FAILED:$*"; return 1; }
+
+execute_optimization system_maintenance
+execute_optimization network_optimization
+[[ "$(optimize_outcome_count failed)" == "2" ]] || exit 1
+[[ "$(optimize_outcome_count applied)" == "0" ]] || exit 1
+EOF
+
+	[[ "$status" -eq 0 ]] || { echo "$output"; return 1; }
+	# system_maintenance used to count the failure without saying why.
+	[[ "$(grep -c 'Failed to refresh DNS cache' <<< "$output")" == "2" ]] || { echo "$output"; return 1; }
+	[[ "$output" == *"Spotlight index verified"* ]] || return 1
+	[[ "$output" != *"DNS cache flushed"* ]]
 }
 
 @test "fix_broken_preferences repairs only non-Apple preference plists" {
@@ -321,7 +433,10 @@ EOF
 }
 
 @test "optimize scans never delete candidates from partial find output" {
-	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+	local test_home="$HOME/partial-find-output"
+	rm -rf "$test_home"
+	mkdir -p "$test_home"
+	run env HOME="$test_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
@@ -330,8 +445,10 @@ saved="$HOME/Library/Saved Application State/Partial.savedState"
 shared="$HOME/Library/Application Support/com.apple.sharedfilelist/Partial.sfl3"
 mkdir -p "$saved" "${shared%/*}"
 touch "$shared"
+# Both tasks send safe_remove output to /dev/null, so a printed marker would
+# never reach $output. Record the call in a file the check below reads.
 safe_remove() {
-    printf 'UNEXPECTED_REMOVE:%s\n' "$1"
+    printf '%s\n' "$1" >> "$HOME/unexpected-removals"
     return 0
 }
 run_with_timeout() {
@@ -349,13 +466,16 @@ optimize_task_finish saved_state_cleanup
 optimize_task_start
 opt_shared_file_list_repair
 optimize_task_finish shared_file_list_repair
+[[ ! -e "$HOME/unexpected-removals" ]] || { cat "$HOME/unexpected-removals"; exit 1; }
 EOF
 
 	[ "$status" -eq 0 ] || {
 		echo "$output"
 		return 1
 	}
-	[[ "$output" != *"UNEXPECTED_REMOVE"* ]]
+	# Both scans really ran and failed, so the empty removal log is not vacuous.
+	[[ "$output" == *"Failed to scan old saved states"* ]] || return 1
+	[[ "$output" == *"Failed to scan shared file lists"* ]]
 }
 
 @test "optimize saved-state cleanup propagates deletion interruption" {
@@ -906,6 +1026,48 @@ EOF
 	[ "$status" -eq 0 ] || return 1
 	[[ "$output" == *"RC=130"* ]] || return 1
 	[[ "$output" != *"UNEXPECTED_WRITE"* ]]
+}
+
+@test "Spotlight rules keep the entire array when it changes during app resolution" {
+    for change in corrupt append; do
+        run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" CHANGE="$change" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+PLIST="$HOME/Library/Preferences/com.apple.spotlight.plist"
+mkdir -p "${PLIST%/*}"
+printf '%s' '<plist version="1.0"><dict><key>EnabledPreferenceRules</key><array><string>com.missing.App</string><string>com.apple.Safari</string></array></dict></plist>' > "$PLIST"
+defaults() { case "$1" in read) return 0;; *) echo "UNEXPECTED_WRITE $*";; esac; }
+bundle_has_installed_app() {
+    if [[ "$CHANGE" == corrupt ]]; then
+        printf 'incomplete plist' > "$PLIST"
+    else
+        /usr/libexec/PlistBuddy -c 'Add :EnabledPreferenceRules: string System.iphoneApps' "$PLIST"
+    fi
+    return 1
+}
+execute_optimization spotlight_orphan_rules_cleanup
+EOF
+        [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+        [[ "$output" != *"UNEXPECTED_WRITE"* ]] || return 1
+        [[ "$output" != *"Removed 1 orphan"* ]] || return 1
+    done
+}
+
+@test "Spotlight rules refuse an array containing a non-string before any write" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+PLIST="$HOME/Library/Preferences/com.apple.spotlight.plist"
+mkdir -p "${PLIST%/*}"
+printf '%s' '<plist version="1.0"><dict><key>EnabledPreferenceRules</key><array><string>com.missing.App</string><dict><key>protected</key><true/></dict></array></dict></plist>' > "$PLIST"
+defaults() { case "$1" in read) return 0;; *) echo "UNEXPECTED_WRITE $*";; esac; }
+bundle_has_installed_app() { return 1; }
+execute_optimization spotlight_orphan_rules_cleanup
+EOF
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"UNEXPECTED_WRITE"* ]] || return 1
 }
 
 @test "opt_spotlight_index_optimize reports optimal when probes are fast" {
@@ -1802,7 +1964,9 @@ EOF
 @test "flush_dns_cache does not invoke sudo under MOLE_TEST_NO_AUTH" {
 	# Reproduces the reported regression: ad-hoc flush_dns_cache under test
 	# mode used to fall through optimize_sudo_available and reach `sudo dscacheutil`.
-	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc <<'EOF'
+	# Pin "no VPN": on a host routing through utun the VPN gate would return
+	# first and this test would pass without reaching the sudo guard.
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 MOLE_ASSUME_VPN_ACTIVE=0 /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
@@ -1920,6 +2084,7 @@ EOF
 @test "has_active_vpn_interface respects MOLE_ASSUME_VPN_ACTIVE override" {
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_ASSUME_VPN_ACTIVE=1 /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
 # Force scutil/route to fail loudly so the env override is the only path.
 scutil() { echo "should not be called" >&2; return 1; }
@@ -1937,6 +2102,7 @@ EOF
 @test "has_active_vpn_interface returns false when MOLE_ASSUME_VPN_ACTIVE=0" {
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_ASSUME_VPN_ACTIVE=0 /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
 # scutil/route should not run when env says no.
 scutil() { echo "should not be called" >&2; return 1; }
@@ -1953,6 +2119,7 @@ EOF
 @test "has_active_vpn_interface detects scutil Connected entry" {
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
 mock_bin="$HOME/vpn-connected-bin"
 mkdir -p "$mock_bin"
@@ -1973,12 +2140,14 @@ EOF
 
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"vpn"* ]] || return 1
+	[[ "$output" != *"no_vpn"* ]] || return 1
 	[[ "$output" != *"should not be called"* ]]
 }
 
 @test "has_active_vpn_interface ignores scutil entries that are all Disconnected" {
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
 mock_bin="$HOME/vpn-disconnected-bin"
 mkdir -p "$mock_bin"
@@ -2003,6 +2172,7 @@ EOF
 @test "has_active_vpn_interface detects full-tunnel via utun default route" {
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
 # No system-managed VPN configured in scutil.
 mock_bin="$HOME/vpn-full-tunnel-bin"
@@ -2016,12 +2186,14 @@ if has_active_vpn_interface; then echo "vpn"; else echo "no_vpn"; fi
 EOF
 
 	[ "$status" -eq 0 ]
-	[[ "$output" == *"vpn"* ]]
+	[[ "$output" == *"vpn"* ]] || return 1
+	[[ "$output" != *"no_vpn"* ]]
 }
 
 @test "has_active_vpn_interface returns false for iCloud Private Relay style utun (#959)" {
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/optimize/tasks.sh"
 # Private Relay / Continuity create utun* but the default route stays on en0.
 # The old netstat/ifconfig probe would have false-positived this; the new
@@ -2065,4 +2237,44 @@ EOF
 	[[ "$output" == *"/Library/Developer/CoreSimulator/Volumes/iOS_17.dmg"$'\t'"/Library/Developer/CoreSimulator/Volumes/iOS_17.0"* ]] || return 1
 	line_count=$(printf '%s\n' "$output" | awk 'NF' | wc -l | tr -d ' ')
 	[ "$line_count" = "2" ]
+}
+
+@test "has_active_vpn_interface treats a missing default route as no VPN" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+mock_bin="$HOME/vpn-offline-bin"
+mkdir -p "$mock_bin"
+printf '#!/bin/bash\necho "* (Disconnected)   AA1B2C3D-1111-2222-3333-444455556666   PPP     (L2TP)         \\"Office VPN\\"   [L2TP]"\n' > "$mock_bin/scutil"
+printf '#!/bin/bash\necho "route: writing to routing socket: not in table" >&2\nexit 1\n' > "$mock_bin/route"
+chmod +x "$mock_bin/scutil" "$mock_bin/route"
+PATH="$mock_bin:$PATH"
+status=0
+has_active_vpn_interface || status=$?
+echo "probe=$status"
+EOF
+
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"probe=1"* ]]
+}
+
+@test "has_active_vpn_interface keeps other route failures unknown" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/optimize/tasks.sh"
+mock_bin="$HOME/vpn-route-error-bin"
+mkdir -p "$mock_bin"
+printf '#!/bin/bash\necho "* (Disconnected)   AA1B2C3D-1111-2222-3333-444455556666   PPP     (L2TP)         \\"Office VPN\\"   [L2TP]"\n' > "$mock_bin/scutil"
+printf '#!/bin/bash\necho "route: socket: Operation not permitted" >&2\nexit 1\n' > "$mock_bin/route"
+chmod +x "$mock_bin/scutil" "$mock_bin/route"
+PATH="$mock_bin:$PATH"
+status=0
+has_active_vpn_interface || status=$?
+echo "probe=$status"
+EOF
+
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"probe=2"* ]]
 }

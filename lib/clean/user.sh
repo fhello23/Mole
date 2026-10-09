@@ -61,18 +61,40 @@ clean_trash() {
                 [[ -e "$trash_item" ]] || continue
                 if is_path_whitelisted "$trash_item" 2> /dev/null ||
                     (declare -f holds_compiled_model_cache > /dev/null 2>&1 &&
-                        holds_compiled_model_cache "$trash_item" 2> /dev/null) ||
-                    ! validate_path_for_deletion "$trash_item" 2> /dev/null; then
+                        holds_compiled_model_cache "$trash_item" 2> /dev/null); then
                     continue
                 fi
                 local trash_item_kb
                 local size_rc=0
                 trash_item_kb=$(get_path_size_kb "$trash_item" 2> /dev/null) || size_rc=$?
-                [[ $size_rc -eq 0 ]] || _mole_record_clean_cancellation "$size_rc"
-                [[ $size_rc -eq 0 ]] || return "$size_rc"
-                [[ "$trash_item_kb" =~ ^[0-9]+$ ]] || trash_item_kb=0
+                # The real run empties an item whose sizing timed out or
+                # failed, so the preview lists it with an unknown size instead
+                # of dropping it or cancelling the later sections. A signal
+                # still cancels.
+                mole_item_size_continues "$size_rc" || return $?
+                local trash_size_known=true
+                [[ $size_rc -eq 0 && "$trash_item_kb" =~ ^[0-9]+$ ]] || {
+                    trash_item_kb=0
+                    trash_size_known=false
+                }
+                if (declare -f holds_compiled_model_cache > /dev/null 2>&1 &&
+                    holds_compiled_model_cache "$trash_item" 2> /dev/null); then
+                    continue
+                fi
+                # Same final predicate as the real sink, including the #1517
+                # top-level Trash exemption, run after sizing so live-owner and
+                # SQLite state is current. The recorder then skips its own
+                # should_protect_path pass, which lacks that exemption.
+                local validate_rc=0
+                validate_path_for_deletion "$trash_item" 2> /dev/null || validate_rc=$?
+                if mole_rc_timeout_or_signal "$validate_rc"; then
+                    _mole_record_clean_cancellation "$validate_rc"
+                    return "$validate_rc"
+                fi
+                [[ $validate_rc -eq 0 ]] || continue
                 if declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
-                    record_dry_run_cleanup_target "$trash_item" "$trash_item_kb" 1 true || continue
+                    local _MOLE_DRY_RUN_TARGET_PREVALIDATED=true
+                    record_dry_run_cleanup_target "$trash_item" "$trash_item_kb" 1 "$trash_size_known" || continue
                 fi
                 preview_count=$((preview_count + 1))
             done < <(command find "$HOME/.Trash" -mindepth 1 -maxdepth 1 -print0 2> /dev/null || true)
@@ -157,6 +179,65 @@ _user_cache_deno_delete_guard() {
     return 0
 }
 
+# Log globs must never enumerate through redirected roots. Bind the directories
+# before enumeration and again after sizing and at the last deletion boundary.
+_user_log_delete_guard() {
+    local candidate="$1"
+    [[ ! -L "$_MOLE_USER_LOG_ROOT" ]] || return 1
+    _mole_path_matches_identity "$_MOLE_USER_LOG_ROOT" \
+        "$_MOLE_USER_LOG_PARENT" "$_MOLE_USER_LOG_PARENT_ID" "$_MOLE_USER_LOG_ROOT_ID" || return 1
+    if [[ "${candidate%/*}" == "$_MOLE_USER_LOG_ROOT/DiagnosticReports" ]]; then
+        [[ -n "$_MOLE_USER_REPORTS_ID" && ! -L "$_MOLE_USER_LOG_ROOT/DiagnosticReports" ]] || return 1
+        _mole_path_matches_identity "$_MOLE_USER_LOG_ROOT/DiagnosticReports" \
+            "$_MOLE_USER_REPORTS_PARENT" "$_MOLE_USER_LOG_ROOT_ID" "$_MOLE_USER_REPORTS_ID" || return 1
+    else
+        [[ "${candidate%/*}" == "$_MOLE_USER_LOG_ROOT" ]] || return 1
+    fi
+}
+
+_clean_user_log_directory() {
+    local _MOLE_USER_LOG_ROOT="$1"
+    local label="$2" ancestor="$1"
+    [[ -d "$ancestor" ]] || return 0
+    # HOME may have a canonical system alias; roots below it must be physical.
+    while [[ "$ancestor" != "$HOME" ]]; do
+        [[ "$ancestor" == "$HOME/"* && ! -L "$ancestor" ]] || return 0
+        ancestor="${ancestor%/*}"
+    done
+    _mole_snapshot_path_identity "$_MOLE_USER_LOG_ROOT" || return 0
+    local _MOLE_USER_LOG_PARENT="$_MOLE_PATH_SNAPSHOT_PARENT"
+    local _MOLE_USER_LOG_PARENT_ID="$_MOLE_PATH_SNAPSHOT_PARENT_ID"
+    local _MOLE_USER_LOG_ROOT_ID="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
+    local _MOLE_USER_REPORTS_ID="" _MOLE_USER_REPORTS_PARENT=""
+    local reports="$_MOLE_USER_LOG_ROOT/DiagnosticReports"
+    local -a targets=()
+    local entry
+    for entry in "$_MOLE_USER_LOG_ROOT"/*; do
+        [[ -e "$entry" || -L "$entry" ]] || continue
+        if [[ "$_MOLE_USER_LOG_ROOT" == "$HOME/Library/Logs" && "$entry" == "$reports" ]]; then
+            # Keep the crash-report directory itself (#1689), including a link.
+            if [[ -d "$reports" && ! -L "$reports" ]] && _mole_snapshot_path_identity "$reports"; then
+                _MOLE_USER_REPORTS_ID="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
+                _MOLE_USER_REPORTS_PARENT="$_MOLE_PATH_SNAPSHOT_PARENT"
+                local report
+                for report in "$reports"/*; do
+                    [[ -e "$report" || -L "$report" ]] && targets+=("$report")
+                done
+            fi
+            continue
+        fi
+        targets+=("$entry")
+    done
+    [[ ${#targets[@]} -gt 0 ]] || return 0
+    local _MOLE_SAFE_REMOVE_FINAL_GUARD=_user_log_delete_guard
+    local clean_rc=0
+    safe_clean_guarded _user_log_delete_guard "${targets[@]}" "$label" || clean_rc=$?
+    if mole_rc_timeout_or_signal "$clean_rc"; then
+        return "$clean_rc"
+    fi
+    return 0
+}
+
 clean_user_essentials() {
     start_section_spinner "Scanning caches..."
     # Deno's default root sits inside the otherwise broad user-cache sweep,
@@ -216,7 +297,7 @@ clean_user_essentials() {
     fi
     stop_section_spinner
 
-    safe_clean ~/Library/Logs/* "User app logs"
+    _clean_user_log_directory "$HOME/Library/Logs" "User app logs" || return $?
 
     if [[ "${MOLE_SKIP_TRASH_CLEANUP:-0}" != "1" ]]; then
         clean_trash
@@ -573,7 +654,7 @@ _clean_chromium_old_versions() {
             fi
 
             local removed=false
-            if has_sudo_session; then
+            if [[ "${SYSTEM_CLEAN:-true}" == "true" ]] && has_sudo_session; then
                 safe_sudo_remove "$dir" "$size_kb" > /dev/null 2>&1 && removed=true
             else
                 safe_remove "$dir" true "$size_kb" > /dev/null 2>&1 && removed=true
@@ -920,14 +1001,17 @@ clean_support_app_data() {
 }
 
 # App caches (merged: macOS system caches + Sandboxed apps).
+# Runs in the caller's shell and returns the count in
+# CACHE_TOP_LEVEL_ENTRY_COUNT: it is called once per container, and a command
+# substitution plus two $(shopt -p) captures cost three forks each time.
 cache_top_level_entry_count_capped() {
     local dir="$1"
     local cap="${2:-101}"
     local count=0
-    local _nullglob_state
-    local _dotglob_state
-    _nullglob_state=$(shopt -p nullglob || true)
-    _dotglob_state=$(shopt -p dotglob || true)
+    local restore_nullglob=false
+    local restore_dotglob=false
+    shopt -q nullglob || restore_nullglob=true
+    shopt -q dotglob || restore_dotglob=true
     shopt -s nullglob dotglob
 
     local item
@@ -939,12 +1023,12 @@ cache_top_level_entry_count_capped() {
         fi
     done
 
-    # eval: restore shopt state captured by $(shopt -p)
-    eval "$_nullglob_state"
-    eval "$_dotglob_state"
+    [[ "$restore_nullglob" == "true" ]] && shopt -u nullglob
+    [[ "$restore_dotglob" == "true" ]] && shopt -u dotglob
 
     [[ "$count" =~ ^[0-9]+$ ]] || count=0
-    printf '%s\n' "$count"
+    CACHE_TOP_LEVEL_ENTRY_COUNT=$count
+    return 0
 }
 
 directory_has_entries() {
@@ -984,7 +1068,7 @@ clean_app_caches() {
     safe_clean ~/Library/Caches/com.apple.photoanalysisd "Photo analysis cache" || true
     safe_clean ~/Library/Caches/com.apple.akd "Apple ID cache" || true
     safe_clean ~/Library/Caches/com.apple.WebKit.Networking/* "WebKit network cache" || true
-    safe_clean ~/Library/DiagnosticReports/* "Diagnostic reports" || true
+    _clean_user_log_directory "$HOME/Library/DiagnosticReports" "Diagnostic reports" || return $?
     safe_clean ~/Library/Caches/com.apple.QuickLook.thumbnailcache "QuickLook thumbnails" || true
     safe_clean ~/Library/Caches/Quick\ Look/* "QuickLook cache" || true
     safe_clean ~/Library/Caches/com.apple.iconservices* "Icon services cache" || true
@@ -1156,7 +1240,8 @@ process_container_cache() {
     [[ -d "$cache_dir" ]] || return 0
     [[ -L "$cache_dir" ]] && return 0
     local item_count
-    item_count=$(cache_top_level_entry_count_capped "$cache_dir" 101)
+    cache_top_level_entry_count_capped "$cache_dir" 101
+    item_count=$CACHE_TOP_LEVEL_ENTRY_COUNT
     [[ "$item_count" =~ ^[0-9]+$ ]] || item_count=0
     [[ "$item_count" -eq 0 ]] && return 0
     local measure_item_sizes=true
@@ -1318,7 +1403,8 @@ clean_group_container_caches() {
 
             local item
             local quick_count
-            quick_count=$(cache_top_level_entry_count_capped "$candidate" 101)
+            cache_top_level_entry_count_capped "$candidate" 101
+            quick_count=$CACHE_TOP_LEVEL_ENTRY_COUNT
             [[ "$quick_count" =~ ^[0-9]+$ ]] || quick_count=0
             [[ "$quick_count" -eq 0 ]] && continue
 
@@ -2089,6 +2175,7 @@ clean_tart_caches() {
         start_section_spinner "Pruning Tart caches..."
     fi
     local prune_succeeded=false
+    local prune_rc=0
     tart_state=0
     mole_pgrep_any -x "tart" || tart_state=$?
     if [[ $tart_state -ne 1 ]]; then
@@ -2102,9 +2189,17 @@ clean_tart_caches() {
         return 0
     elif run_with_timeout "$MOLE_TIMEOUT_PKG_CLEANUP_SEC" tart prune --entries caches --older-than "$MOLE_ORPHAN_AGE_DAYS" > /dev/null 2>&1; then
         prune_succeeded=true
+    else
+        prune_rc=$?
     fi
     if [[ -t 1 ]]; then
         stop_section_spinner
+    fi
+    if mole_rc_signal "$prune_rc"; then
+        # Ctrl-C while tart holds the terminal reaches only the child.
+        debug_log "Tart caches: owner command interrupted (exit $prune_rc)"
+        _mole_record_clean_cancellation "$prune_rc" "Tart caches"
+        return "$prune_rc"
     fi
 
     if [[ "$prune_succeeded" != "true" ]]; then
@@ -2261,7 +2356,7 @@ clean_application_support_logs() {
             is_protected=true
         else
             local app_name_lower
-            app_name_lower=$(echo "$app_name" | LC_ALL=C tr '[:upper:]' '[:lower:]')
+            mole_ascii_lowercase app_name_lower "$app_name"
             if should_protect_data "$app_name_lower"; then
                 is_protected=true
             fi
@@ -2619,17 +2714,63 @@ jetbrains_stale_version_dirs() {
         '
 }
 
-# AI coding agents create full checkouts that accumulate silently: Claude Code
-# under <project>/.claude/worktrees/, the Codex app under ~/.codex/worktrees/.
-# Report only, same 1GB bar as other large candidates; removal stays a manual
-# `git worktree remove` decision because a worktree may hold agent work.
-report_agent_worktree_candidates() {
-    local threshold_kb=$((1024 * 1024)) # 1GB
+# List every agent worktree container once, NUL-separated: the Codex app's
+# fixed container first, then each `.claude/worktrees` under the project roots.
+agent_worktree_containers() {
     local -a roots=(
         "$HOME/code" "$HOME/Code" "$HOME/dev" "$HOME/Projects"
         "$HOME/GitHub" "$HOME/Workspace" "$HOME/Repos"
         "$HOME/Development" "$HOME/www" "$HOME/src"
     )
+    local container
+    # The Codex app keeps every worktree under one fixed container outside
+    # any project root, so the find below never reaches it.
+    container="$HOME/.codex/worktrees"
+    if [[ -d "$container" && ! -L "$container" ]]; then
+        printf '%s\0' "$container"
+    fi
+
+    # ~/code and ~/Code are one directory on case-insensitive APFS, and a root
+    # may be a symlink to another. Scan each physical root once, or every
+    # container is reported twice (same class as #590 and #1416). A root can
+    # also sit inside another one, so containers are deduplicated as well.
+    local -a scanned_roots=() listed_containers=()
+    local root physical_root scanned already_scanned
+    for root in "${roots[@]}"; do
+        [[ -d "$root" ]] || continue
+        physical_root=$(mole_purge_resolve_path_case "$root")
+        already_scanned=false
+        for scanned in "${scanned_roots[@]+"${scanned_roots[@]}"}"; do
+            if [[ "$scanned" == "$physical_root" ]]; then
+                already_scanned=true
+                break
+            fi
+        done
+        [[ "$already_scanned" == "false" ]] || continue
+        scanned_roots+=("$physical_root")
+        while IFS= read -r -d '' container; do
+            already_scanned=false
+            for scanned in "${listed_containers[@]+"${listed_containers[@]}"}"; do
+                if [[ "$scanned" == "$container" ]]; then
+                    already_scanned=true
+                    break
+                fi
+            done
+            [[ "$already_scanned" == "false" ]] || continue
+            listed_containers+=("$container")
+            printf '%s\0' "$container"
+        done < <(run_with_timeout "$MOLE_TIMEOUT_PKG_CLEANUP_SEC" command find "$physical_root" -maxdepth 6 -type d -path "*/.claude/worktrees" -prune -print0 2> /dev/null)
+    done
+}
+
+# AI coding agents create full checkouts that accumulate silently: Claude Code
+# under <project>/.claude/worktrees/, the Codex app under ~/.codex/worktrees/.
+# Report only, same 1GB bar as other large candidates; removal stays a manual
+# `git worktree remove` decision because a worktree may hold agent work.
+# $1 may name a container listing that Large files started ahead of time.
+report_agent_worktree_candidates() {
+    local listing_file="${1:-}"
+    local threshold_kb=$((1024 * 1024)) # 1GB
 
     _report_agent_worktree_container() {
         local container="$1"
@@ -2654,46 +2795,10 @@ report_agent_worktree_candidates() {
     }
 
     local container rc=0
-    # The Codex app keeps every worktree under one fixed container outside
-    # any project root, so the find below never reaches it.
-    container="$HOME/.codex/worktrees"
-    if [[ -d "$container" && ! -L "$container" ]]; then
+    while IFS= read -r -d '' container; do
         _report_agent_worktree_container "$container" || rc=$?
-    fi
-
-    # ~/code and ~/Code are one directory on case-insensitive APFS, and a root
-    # may be a symlink to another. Scan each physical root once, or every
-    # container is reported twice (same class as #590 and #1416). A root can
-    # also sit inside another one, so containers are deduplicated as well.
-    local -a scanned_roots=() reported_containers=()
-    local root physical_root scanned already_scanned
-    for root in "${roots[@]}"; do
         [[ $rc -eq 0 ]] || break
-        [[ -d "$root" ]] || continue
-        physical_root=$(mole_purge_resolve_path_case "$root")
-        already_scanned=false
-        for scanned in "${scanned_roots[@]+"${scanned_roots[@]}"}"; do
-            if [[ "$scanned" == "$physical_root" ]]; then
-                already_scanned=true
-                break
-            fi
-        done
-        [[ "$already_scanned" == "false" ]] || continue
-        scanned_roots+=("$physical_root")
-        while IFS= read -r -d '' container; do
-            already_scanned=false
-            for scanned in "${reported_containers[@]+"${reported_containers[@]}"}"; do
-                if [[ "$scanned" == "$container" ]]; then
-                    already_scanned=true
-                    break
-                fi
-            done
-            [[ "$already_scanned" == "false" ]] || continue
-            reported_containers+=("$container")
-            _report_agent_worktree_container "$container" || rc=$?
-            [[ $rc -eq 0 ]] || break
-        done < <(run_with_timeout "$MOLE_TIMEOUT_PKG_CLEANUP_SEC" command find "$physical_root" -maxdepth 6 -type d -path "*/.claude/worktrees" -prune -print0 2> /dev/null)
-    done
+    done < <(if [[ -n "$listing_file" && -f "$listing_file" ]]; then cat "$listing_file"; else agent_worktree_containers; fi)
 
     unset -f _report_agent_worktree_container
     return "$rc"
@@ -2727,8 +2832,229 @@ docker_df_review_segment() {
     fi
 }
 
+# Large file candidates measure a few dozen folders with du, and two or three
+# of them (device backups, simulators, DerivedData) take seconds each. Measure
+# the fixed rows ahead of the report, a few at a time, so their times overlap
+# instead of adding up; rows still print one by one in their usual order.
+# The report takes a row's result from here when it was queued and measures
+# inline otherwise, so a row missing from this list is only slower.
+_large_prefetch_queue_rows() {
+    local android_avd_root="$HOME/.android/avd"
+    [[ "${ANDROID_AVD_HOME:-}" == /* ]] && android_avd_root="$ANDROID_AVD_HOME"
+    local android_sdk_root="$HOME/Library/Android/sdk"
+    if [[ "${ANDROID_HOME:-}" == /* ]]; then
+        android_sdk_root="$ANDROID_HOME"
+    elif [[ "${ANDROID_SDK_ROOT:-}" == /* ]]; then
+        android_sdk_root="$ANDROID_SDK_ROOT"
+    fi
+    local hf_root="$HOME/.cache/huggingface"
+    [[ "${HF_HOME:-}" == /* ]] && hf_root="$HF_HOME"
+    local mise_installs="$HOME/.local/share/mise/installs"
+    [[ "${MISE_DATA_DIR:-}" == /* ]] && mise_installs="$MISE_DATA_DIR/installs"
+    local fvm_versions="$HOME/fvm/versions"
+    [[ "${FVM_CACHE_PATH:-}" == /* ]] && fvm_versions="$FVM_CACHE_PATH/versions"
+    local deno_module_cache=""
+    deno_module_cache=$(mole_deno_cache_root 2> /dev/null) || deno_module_cache=""
+    local path
+    for path in \
+        "$HOME/Library/Developer/Xcode/DerivedData" \
+        "$HOME/Library/Developer/CoreSimulator/Devices" \
+        "$HOME/Library/Application Support/MobileSync/Backup" \
+        "$HOME/Library/Mail" \
+        "$HOME/Library/Mail Downloads" \
+        "$HOME/Library/Updates" \
+        "$HOME/Library/Developer/Xcode/Archives" \
+        "$HOME/Library/Containers/com.docker.docker/Data" \
+        "$HOME/.lmstudio/models" \
+        "$HOME"/Library/Group\ Containers/*dev.orbstack/data \
+        "$HOME/OrbStack" \
+        "$HOME/.lima" \
+        "$HOME/.m2/repository" \
+        "$HOME/.ivy2/cache" \
+        "$HOME/.nuget/packages" \
+        "$deno_module_cache" \
+        "$HOME/Library/pnpm/store" \
+        "$HOME/.conda/pkgs" \
+        "$HOME/anaconda3/pkgs" \
+        "$HOME/.gradle/caches" \
+        "$android_avd_root" \
+        "$android_sdk_root/system-images" \
+        "$hf_root" \
+        "$mise_installs"/* \
+        "$fvm_versions"; do
+        [[ -d "$path" && ! -L "$path" ]] || continue
+        printf '%s\n' "$path"
+    done
+}
+
+# Measure the queued rows before the report runs, at most four at a time,
+# all in this shell so the pool's bookkeeping never sits in a subshell. Each
+# worker writes "status\noutput" to its row's result file. Once the shared
+# deadline has passed no further row is started: the report measures those
+# inline with their usual per-row budget, so the worst case stays as before.
+_large_prefetch_run() {
+    local total=${#_lp_paths[@]} next=0 slot
+    local -a pids=() indexes=()
+    _large_prefetch_kill() {
+        local pid
+        for pid in "${pids[@]+"${pids[@]}"}"; do
+            # The timeout helper and du run under the worker; stop them too.
+            pkill -TERM -P "$pid" 2> /dev/null || true
+            kill "$pid" 2> /dev/null || true
+        done
+        for pid in "${pids[@]+"${pids[@]}"}"; do
+            wait "$pid" 2> /dev/null || true
+        done
+        pids=()
+        indexes=()
+    }
+    local previous_int_trap previous_term_trap
+    previous_int_trap=$(trap -p INT || true)
+    previous_term_trap=$(trap -p TERM || true)
+    trap '_lp_interrupted=130; _large_prefetch_kill' INT
+    trap '_lp_interrupted=143; _large_prefetch_kill' TERM
+
+    while [[ $_lp_interrupted -lt 128 ]]; do
+        while [[ $_lp_interrupted -lt 128 && ${#pids[@]} -lt $_lp_max && $next -lt $total ]]; do
+            local timeout_seconds=""
+            if ! timeout_seconds=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_HINT_SCAN_SEC" "$_lp_deadline"); then
+                next=$total
+                break
+            fi
+            # A row the pool cannot give its usual budget is better measured
+            # inline later, where it gets that budget again.
+            if [[ ${timeout_seconds%%.*} -lt ${MOLE_LARGE_CANDIDATE_SIZE_TIMEOUT:-3} ]]; then
+                next=$total
+                break
+            fi
+            local path="${_lp_paths[next]}" result="$_lp_dir/$next"
+            (
+                rc=0
+                run_with_timeout "$timeout_seconds" du -skP "$path" > "$result.out" 2> /dev/null || rc=$?
+                { printf '%s\n' "$rc" && head -n 1 "$result.out"; } > "$result.tmp" && mv "$result.tmp" "$result"
+            ) < /dev/null > /dev/null 2>&1 &
+            pids+=("$!")
+            indexes+=("$next")
+            next=$((next + 1))
+        done
+        [[ ${#pids[@]} -gt 0 ]] || break
+        local finished="" wait_rc=0
+        mole_wait_for_any_worker finished "${pids[@]}" || wait_rc=$?
+        if [[ -z "$finished" ]]; then
+            # The poll itself was interrupted.
+            [[ $wait_rc -ge 128 ]] && _lp_interrupted=$wait_rc
+            break
+        fi
+        # The trap already stopped and cleared every worker.
+        [[ $_lp_interrupted -lt 128 ]] || break
+        local -a kept_pids=() kept_indexes=()
+        for slot in "${!pids[@]}"; do
+            [[ "${pids[$slot]}" == "$finished" ]] && continue
+            kept_pids+=("${pids[$slot]}")
+            kept_indexes+=("${indexes[$slot]}")
+        done
+        pids=("${kept_pids[@]+"${kept_pids[@]}"}")
+        indexes=("${kept_indexes[@]+"${kept_indexes[@]}"}")
+    done
+    _large_prefetch_kill
+    unset -f _large_prefetch_kill
+    trap - INT TERM
+    # eval: restore caller traps captured by $(trap -p)
+    [[ -n "$previous_int_trap" ]] && eval "$previous_int_trap"
+    [[ -n "$previous_term_trap" ]] && eval "$previous_term_trap"
+    [[ $_lp_interrupted -lt 128 ]] || return "$_lp_interrupted"
+    return 0
+}
+
+# A queued row's measurement, read-only so it also works inside $(...).
+# Returns 1 when the row has no result and must be measured inline.
+_large_prefetch_result() {
+    local path="$1"
+    local output_name="$2"
+    local status_name="$3"
+    [[ -n "${_lp_dir:-}" ]] || return 1
+    local i
+    for ((i = 0; i < ${#_lp_paths[@]}; i++)); do
+        [[ "${_lp_paths[i]}" == "$path" ]] || continue
+        [[ -f "$_lp_dir/$i" ]] || return 1
+        local measured_rc="" measured_output=""
+        { IFS= read -r measured_rc && IFS= read -r measured_output; } < "$_lp_dir/$i" || true
+        [[ "$measured_rc" =~ ^[0-9]+$ ]] || return 1
+        printf -v "$output_name" '%s' "$measured_output"
+        printf -v "$status_name" '%s' "$measured_rc"
+        return 0
+    done
+    return 1
+}
+
+# The worktree container search walks every project root (seconds on a large
+# ~/www) and only feeds the last rows, so it runs beside the size pool. Wait
+# for it here, in the report's own shell, and keep its listing only when it
+# finished cleanly.
+_large_prefetch_worktree_wait() {
+    _lp_worktree_listing=""
+    [[ -n "${_lp_dir:-}" && -n "${_lp_worktree_pid:-}" ]] || return 0
+    local wait_rc=0
+    wait "$_lp_worktree_pid" 2> /dev/null || wait_rc=$?
+    _lp_worktree_pid=""
+    if [[ $wait_rc -eq 0 && -f "$_lp_dir/worktrees" ]]; then
+        _lp_worktree_listing="$_lp_dir/worktrees"
+    fi
+}
+
+_large_prefetch_worktree_stop() {
+    [[ -n "${_lp_worktree_pid:-}" ]] || return 0
+    pkill -TERM -P "$_lp_worktree_pid" 2> /dev/null || true
+    kill "$_lp_worktree_pid" 2> /dev/null || true
+    wait "$_lp_worktree_pid" 2> /dev/null || true
+    _lp_worktree_pid=""
+}
+
 # Large file candidates (report only, no deletion).
 check_large_file_candidates() {
+    local -a _lp_paths=()
+    local _lp_dir="" _lp_max=4 _lp_interrupted=0 _lp_worktree_pid="" _lp_worktree_listing=""
+    local _lp_deadline=$((SECONDS + MOLE_TIMEOUT_HINT_SCAN_SEC))
+    local _lp_path
+    if _lp_dir=$(create_temp_dir); then
+        while IFS= read -r _lp_path; do
+            [[ -n "$_lp_path" ]] && _lp_paths+=("$_lp_path")
+        done < <(_large_prefetch_queue_rows)
+        (agent_worktree_containers > "$_lp_dir/worktrees.tmp" && mv "$_lp_dir/worktrees.tmp" "$_lp_dir/worktrees") < /dev/null > /dev/null 2>&1 &
+        _lp_worktree_pid=$!
+    else
+        _lp_dir=""
+    fi
+
+    start_section_spinner "Scanning large files..."
+    local body_rc=0
+    if [[ -n "$_lp_dir" && ${#_lp_paths[@]} -gt 0 ]]; then
+        _large_prefetch_run || body_rc=$?
+    fi
+    if [[ $body_rc -ge 128 ]]; then
+        _mole_record_clean_cancellation "$body_rc"
+        stop_section_spinner
+    else
+        # While the report runs, a signal must still stop the background
+        # worktree search before the caller's own handler takes over.
+        local previous_int_trap previous_term_trap
+        previous_int_trap=$(trap -p INT || true)
+        previous_term_trap=$(trap -p TERM || true)
+        trap '_large_prefetch_worktree_stop; trap - INT; [[ -n "$previous_int_trap" ]] && eval "$previous_int_trap"; kill -INT $$' INT
+        trap '_large_prefetch_worktree_stop; trap - TERM; [[ -n "$previous_term_trap" ]] && eval "$previous_term_trap"; kill -TERM $$' TERM
+        _check_large_file_candidates_body || body_rc=$?
+        trap - INT TERM
+        # eval: restore caller traps captured by $(trap -p)
+        [[ -n "$previous_int_trap" ]] && eval "$previous_int_trap"
+        [[ -n "$previous_term_trap" ]] && eval "$previous_term_trap"
+    fi
+
+    _large_prefetch_worktree_stop
+    [[ -n "$_lp_dir" ]] && rm -rf "$_lp_dir" # SAFE: exact mktemp-created Large files measurement scratch directory
+    return "$body_rc"
+}
+
+_check_large_file_candidates_body() {
     local threshold_kb=$((1024 * 1024)) # 1GB
     local found_any=false
     local size_rc=0
@@ -2736,15 +3062,21 @@ check_large_file_candidates() {
     _large_candidate_size_kb() {
         local path="$1"
         local timeout_seconds="${2:-${MOLE_LARGE_CANDIDATE_SIZE_TIMEOUT:-3}}"
+        local exact="${3:-}"
         [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || timeout_seconds=3
         local du_output="" du_rc=0
-        du_output=$(run_with_timeout "$timeout_seconds" du -skP "$path" 2> /dev/null) || du_rc=$?
+        if ! _large_prefetch_result "$path" du_output du_rc; then
+            du_output=$(run_with_timeout "$timeout_seconds" du -skP "$path" 2> /dev/null) || du_rc=$?
+        fi
         # Review-only: a timed-out or failed du skips this row. Signals still
-        # cancel the run so Ctrl-C stays sticky.
+        # cancel the run so Ctrl-C stays sticky. BSD du exits 1 when some
+        # entry is unreadable yet still prints the total of everything it
+        # read, a usable lower bound; a timeout's output is never a total.
+        # Rows passed "exact" (E5RT, #1631) never show a lower bound.
         if [[ $du_rc -ge 128 ]]; then
             return "$du_rc"
         fi
-        [[ $du_rc -eq 0 ]] || return 1
+        [[ $du_rc -eq 0 || ($du_rc -eq 1 && "$exact" != "exact") ]] || return 1
         local size_kb="${du_output%%[^0-9]*}"
         [[ "$size_kb" =~ ^[0-9]+$ ]] || return 1
         printf '%s\n' "$size_kb"
@@ -2774,7 +3106,9 @@ check_large_file_candidates() {
     # short size field, so it lands in a stable column and reads as a date on
     # its own. The review icon carries the review-only semantics;
     # format_path_link keeps the path clickable even with spaces (OSC 8 link,
-    # not terminal auto-linking).
+    # not terminal auto-linking). The label already names the location, so
+    # the link shows only the last two segments; the full path stays one
+    # click away, and plain-text output keeps it whole.
     _report_large_review_row() {
         local label="$1"
         local size_human="$2"
@@ -2782,22 +3116,31 @@ check_large_file_candidates() {
         local newest_date="${4:-}"
         local date_part=""
         [[ -n "$newest_date" ]] && date_part=" · ${GRAY}${newest_date}${NC}"
+        local shown="${path/#$HOME/~}"
+        local tail="${shown%/*}"
+        tail="${tail##*/}/${shown##*/}"
+        # shellcheck disable=SC2088 # compares the ~-abbreviated display text, not a path
+        if [[ "$shown" != "~/$tail" && "$shown" != "/$tail" && "$shown" != "$tail" ]]; then
+            shown="…/$tail"
+        fi
         stop_section_spinner
-        echo -e "  ${YELLOW}${ICON_REVIEW}${NC} ${label} · ${GREEN}${size_human}${NC}${date_part} · ${GRAY}$(format_path_link "$path")${NC}"
+        echo -e "  ${YELLOW}${ICON_REVIEW}${NC} ${label} · ${GREEN}${size_human}${NC}${date_part} · ${GRAY}$(format_path_link "$path" "$shown")${NC}"
         found_any=true
         start_section_spinner "Scanning large files..."
     }
 
     # Pass "date" as $4 on rows where staleness decides the action. Rows left
-    # without it stay two fields wide.
+    # without it stay two fields wide. Pass "exact" as $5 to drop the row
+    # instead of showing a total that skipped unreadable entries.
     _report_large_review_dir() {
         local label="$1"
         local path="$2"
         local probe_timeout="${3:-}"
         local want_date="${4:-}"
+        local exact="${5:-}"
         [[ -d "$path" ]] || return 0
         local size_kb="" size_rc=0
-        size_kb=$(_large_candidate_size_kb "$path" "$probe_timeout") || size_rc=$?
+        size_kb=$(_large_candidate_size_kb "$path" "$probe_timeout" "$exact") || size_rc=$?
         if [[ $size_rc -ge 128 ]]; then
             return "$size_rc"
         fi
@@ -2940,10 +3283,12 @@ check_large_file_candidates() {
     # neither the current build nor older build subdirectories are deleted.
     # Bound the complete listing and all measurements with one shared budget.
     local cache_root="$HOME/Library/Caches"
-    if [[ -d "$cache_root" && ! -L "$cache_root" ]]; then
-        local compiled_list compiled_rc=0 compiled_path compiled_owner compiled_timeout
+    local compiled_list=""
+    # Without a scratch listing only this row is skipped; the remaining rows
+    # and the section's activity still follow.
+    if [[ -d "$cache_root" && ! -L "$cache_root" ]] && compiled_list=$(create_temp_file); then
+        local compiled_rc=0 compiled_path compiled_owner compiled_timeout
         local compiled_deadline=$((SECONDS + MOLE_TIMEOUT_HINT_SCAN_SEC))
-        compiled_list=$(create_temp_file) || return 0
         run_with_timeout "$MOLE_TIMEOUT_HINT_SCAN_SEC" find "$cache_root" -mindepth 1 -maxdepth 2 \
             \( -name '.*' -prune \) -o \
             \( -type d -name 'com.apple.e5rt.e5bundlecache' -print0 \) \
@@ -2953,7 +3298,7 @@ check_large_file_candidates() {
                 [[ -d "$compiled_path" && ! -L "$compiled_path" && ! -L "${compiled_path%/*}" ]] || continue
                 compiled_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_HINT_SCAN_SEC" "$compiled_deadline") || break
                 compiled_owner="${compiled_path%/*}"
-                _report_large_or_stop "Compiled model cache (${compiled_owner##*/})" "$compiled_path" "$compiled_timeout" || {
+                _report_large_or_stop "Compiled model cache (${compiled_owner##*/})" "$compiled_path" "$compiled_timeout" "" exact || {
                     compiled_rc=$?
                     break
                 }
@@ -3011,7 +3356,8 @@ check_large_file_candidates() {
         _report_large_or_stop "JetBrains old version data" "$jetbrains_support/$jb_stale" || return $?
     done < <(jetbrains_stale_version_dirs "$jetbrains_support")
 
-    report_agent_worktree_candidates
+    _large_prefetch_worktree_wait
+    report_agent_worktree_candidates "$_lp_worktree_listing"
 
     stop_section_spinner
 

@@ -448,8 +448,9 @@ write_clean_preview_header() {
 # Mole Cleanup Preview - $(date '+%Y-%m-%d %H:%M:%S')
 #
 # How to protect files:
-# 1. Copy any path below to ~/.config/mole/whitelist
-# 2. Run: mo clean --whitelist
+# 1. Run mo clean --whitelist and press Enter to save your selections
+# 2. Append paths below to ~/.config/mole/whitelist, one per line
+# A saved file replaces optional defaults; built-in safety protections still apply.
 #
 # Example:
 #   /Users/*/Library/Caches/com.example.app
@@ -810,7 +811,9 @@ classify_cleanup_risk() {
 # Internal implementation shared by the normal and process-guarded cleanup
 # entry points. The first argument is an optional callback that must return 0
 # immediately before each deletion sink; callers use it to bind a process-state
-# check to the path that was just sized.
+# check to the path that was just sized. A refusal stops the batch, except one
+# that sets _MOLE_SAFE_CLEAN_SKIP_PATH to the path it was handed: that target
+# alone is skipped and the rest continue.
 # shellcheck disable=SC2329
 _safe_clean_impl() {
     local delete_guard="$1"
@@ -873,6 +876,7 @@ _safe_clean_impl() {
     # final identity check. These names deliberately use dynamic scope so the
     # callback can populate them without stdout/command-substitution races.
     local _MOLE_SAFE_CLEAN_BOUND_PATH=""
+    local _MOLE_SAFE_CLEAN_SKIP_PATH=""
     local _MOLE_SAFE_CLEAN_EXPECTED_PARENT=""
     local _MOLE_SAFE_CLEAN_EXPECTED_PARENT_ID=""
     local _MOLE_SAFE_CLEAN_EXPECTED_TARGET_ID=""
@@ -1148,6 +1152,7 @@ _safe_clean_impl() {
             fi
             MOLE_CLEAN_CANCEL_STATUS=$cleanup_interrupt_rc
             export MOLE_CLEAN_CANCEL_STATUS
+            _mole_note_clean_cancel_source "$description"
             return "$cleanup_interrupt_rc"
         fi
 
@@ -1176,6 +1181,7 @@ _safe_clean_impl() {
                     if [[ "$DRY_RUN" != "true" ]]; then
                         if [[ -n "$delete_guard" ]]; then
                             _MOLE_SAFE_CLEAN_BOUND_PATH=""
+                            _MOLE_SAFE_CLEAN_SKIP_PATH=""
                             _MOLE_SAFE_CLEAN_EXPECTED_PARENT=""
                             _MOLE_SAFE_CLEAN_EXPECTED_PARENT_ID=""
                             _MOLE_SAFE_CLEAN_EXPECTED_TARGET_ID=""
@@ -1183,6 +1189,9 @@ _safe_clean_impl() {
                             if mole_rc_timeout_or_signal "$action_rc"; then
                                 cleanup_interrupt_rc=$action_rc
                                 break
+                            elif [[ $action_rc -ne 0 && "$_MOLE_SAFE_CLEAN_SKIP_PATH" == "$path" ]]; then
+                                idx=$((idx + 1))
+                                continue
                             elif [[ $action_rc -ne 0 ]]; then
                                 delete_guard_stopped=1
                                 break
@@ -1212,6 +1221,7 @@ _safe_clean_impl() {
                     else
                         if [[ -n "$delete_guard" ]]; then
                             _MOLE_SAFE_CLEAN_BOUND_PATH=""
+                            _MOLE_SAFE_CLEAN_SKIP_PATH=""
                             _MOLE_SAFE_CLEAN_EXPECTED_PARENT=""
                             _MOLE_SAFE_CLEAN_EXPECTED_PARENT_ID=""
                             _MOLE_SAFE_CLEAN_EXPECTED_TARGET_ID=""
@@ -1219,6 +1229,9 @@ _safe_clean_impl() {
                             if mole_rc_timeout_or_signal "$action_rc"; then
                                 cleanup_interrupt_rc=$action_rc
                                 break
+                            elif [[ $action_rc -ne 0 && "$_MOLE_SAFE_CLEAN_SKIP_PATH" == "$path" ]]; then
+                                idx=$((idx + 1))
+                                continue
                             elif [[ $action_rc -ne 0 ]]; then
                                 delete_guard_stopped=1
                                 break
@@ -1287,6 +1300,7 @@ _safe_clean_impl() {
                 if [[ "$DRY_RUN" != "true" ]]; then
                     if [[ -n "$delete_guard" ]]; then
                         _MOLE_SAFE_CLEAN_BOUND_PATH=""
+                        _MOLE_SAFE_CLEAN_SKIP_PATH=""
                         _MOLE_SAFE_CLEAN_EXPECTED_PARENT=""
                         _MOLE_SAFE_CLEAN_EXPECTED_PARENT_ID=""
                         _MOLE_SAFE_CLEAN_EXPECTED_TARGET_ID=""
@@ -1294,6 +1308,9 @@ _safe_clean_impl() {
                         if mole_rc_timeout_or_signal "$action_rc"; then
                             cleanup_interrupt_rc=$action_rc
                             break
+                        elif [[ $action_rc -ne 0 && "$_MOLE_SAFE_CLEAN_SKIP_PATH" == "$path" ]]; then
+                            idx=$((idx + 1))
+                            continue
                         elif [[ $action_rc -ne 0 ]]; then
                             delete_guard_stopped=1
                             break
@@ -1322,6 +1339,7 @@ _safe_clean_impl() {
                 else
                     if [[ -n "$delete_guard" ]]; then
                         _MOLE_SAFE_CLEAN_BOUND_PATH=""
+                        _MOLE_SAFE_CLEAN_SKIP_PATH=""
                         _MOLE_SAFE_CLEAN_EXPECTED_PARENT=""
                         _MOLE_SAFE_CLEAN_EXPECTED_PARENT_ID=""
                         _MOLE_SAFE_CLEAN_EXPECTED_TARGET_ID=""
@@ -1329,6 +1347,9 @@ _safe_clean_impl() {
                         if mole_rc_timeout_or_signal "$action_rc"; then
                             cleanup_interrupt_rc=$action_rc
                             break
+                        elif [[ $action_rc -ne 0 && "$_MOLE_SAFE_CLEAN_SKIP_PATH" == "$path" ]]; then
+                            idx=$((idx + 1))
+                            continue
                         elif [[ $action_rc -ne 0 ]]; then
                             delete_guard_stopped=1
                             break
@@ -1370,6 +1391,7 @@ _safe_clean_impl() {
     if [[ $cleanup_interrupt_rc -ne 0 ]]; then
         MOLE_CLEAN_CANCEL_STATUS=$cleanup_interrupt_rc
         export MOLE_CLEAN_CANCEL_STATUS
+        _mole_note_clean_cancel_source "$description"
         return "$cleanup_interrupt_rc"
     fi
 
@@ -1439,6 +1461,8 @@ start_cleanup() {
     export MOLE_CURRENT_COMMAND="clean"
     MOLE_CLEAN_CANCEL_STATUS=0
     export MOLE_CLEAN_CANCEL_STATUS
+    MOLE_CLEAN_CANCEL_SOURCE=""
+    export MOLE_CLEAN_CANCEL_SOURCE
     MOLE_CLEAN_SIZING_TIMEOUTS=0
     export MOLE_CLEAN_SIZING_TIMEOUTS
     MOLE_CLEAN_REMOVAL_TIMEOUTS=0
@@ -1672,9 +1696,11 @@ perform_cleanup() {
         if mole_rc_timeout_or_signal "$step_rc"; then
             MOLE_CLEAN_CANCEL_STATUS=$step_rc
             export MOLE_CLEAN_CANCEL_STATUS
+            _mole_note_clean_cancel_source "$step_name"
             return "$step_rc"
         fi
         if mole_rc_timeout_or_signal "$pending_clean_cancel"; then
+            _mole_note_clean_cancel_source "$step_name"
             return "$pending_clean_cancel"
         fi
         if [[ "$required" == "true" && $step_rc -ne 0 ]]; then
@@ -1772,9 +1798,9 @@ perform_cleanup() {
             # cannot remove a record whose app is already gone: on macOS 15 and
             # later it fails with -10814 for every such path, which is exactly
             # the set this would have targeted, so the step could only ever
-            # report failures. `mo optimize` already offers the supported
-            # repair (`lsregister -gc` plus a domain rescan) as an explicit,
-            # user-triggered task.
+            # report failures. `mo optimize` no longer rebuilds LaunchServices
+            # either: the rebuild made a running VPN extension read as
+            # reinstalled, so no command offers this repair.
             _run_cleanup_step clean_orphaned_container_stubs || return $?
             _run_cleanup_step show_user_launch_agent_hint_notice || return $?
             end_section
@@ -1846,13 +1872,26 @@ perform_cleanup() {
 
     local -a summary_details=()
     if [[ $cleanup_cancel_rc -ne 0 ]]; then
+        local cancel_source=""
+        cancel_source=$(mole_terminal_safe_text "${MOLE_CLEAN_CANCEL_SOURCE:-}")
+        local cancel_reason=""
         if mole_rc_timeout "$cleanup_cancel_rc"; then
-            summary_details+=("${GRAY}${ICON_WARNING}${NC} Cancelled: a scan or size check timed out (exit 124). Remaining cleanup was skipped.")
+            if [[ -n "$cancel_source" ]]; then
+                cancel_reason="Cancelled: $cancel_source timed out (exit $cleanup_cancel_rc)."
+            else
+                cancel_reason="Cancelled: a scan or size check timed out (exit $cleanup_cancel_rc)."
+            fi
         elif [[ $cleanup_cancel_rc -ge 128 ]]; then
-            summary_details+=("${GRAY}${ICON_WARNING}${NC} Cancelled: a cleanup step was interrupted (exit $cleanup_cancel_rc). Remaining cleanup was skipped.")
+            if [[ -n "$cancel_source" ]]; then
+                cancel_reason="Cancelled: $cancel_source was interrupted (exit $cleanup_cancel_rc)."
+            else
+                cancel_reason="Cancelled: a cleanup step was interrupted (exit $cleanup_cancel_rc)."
+            fi
         else
-            summary_details+=("${GRAY}${ICON_WARNING}${NC} A required cleanup step failed (exit $cleanup_cancel_rc). Remaining cleanup was skipped.")
+            cancel_reason="A required cleanup step failed (exit $cleanup_cancel_rc)."
         fi
+        summary_details+=("${GRAY}${ICON_WARNING}${NC} $cancel_reason Remaining cleanup was skipped.")
+        log_warning_to_file "$cancel_reason Section: ${CURRENT_SECTION:-unknown}."
     fi
 
     # Emit one "Free space" line, with the measured delta in parentheses when

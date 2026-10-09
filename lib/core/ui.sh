@@ -181,8 +181,15 @@ _read_key_discard_csi() {
 # Read single keyboard input
 read_key() {
     local key rest read_status
-    IFS= read -r -s -n 1 key
-    read_status=$?
+    if [[ "${1:-}" == "1" ]]; then
+        # Bash 3.2 returns 1 for both EOF and timeout; elapsed shell time
+        # distinguishes an idle tick from immediate EOF. ESC reads stay below.
+        local read_started=$SECONDS
+        if IFS= read -r -s -n 1 -t 1 key; then read_status=0; else read_status=$?; fi
+        if [[ "$read_status" -ne 0 ]] && ((SECONDS > read_started)); then return 1; fi
+    else
+        if IFS= read -r -s -n 1 key; then read_status=0; else read_status=$?; fi
+    fi
     [[ $read_status -ne 0 ]] && {
         echo "QUIT"
         return 0
@@ -291,30 +298,40 @@ read_key() {
     esac
 }
 
+# Absolute path on purpose: a version-manager shim earlier on PATH can fail or
+# start slowly, and this runs after every menu key.
+_mole_drain_with_perl() {
+    [[ -x /usr/bin/perl ]] || return 127
+    /usr/bin/perl -MPOSIX=tcflush,TCIFLUSH -e '
+        my $timeout = shift;
+        if (-t STDIN) {
+            select undef, undef, undef, $timeout;
+            exit(defined(tcflush(fileno(STDIN), TCIFLUSH)) ? 0 : 1);
+        }
+        my $input = "";
+        vec($input, fileno(STDIN), 1) = 1;
+        for (1..101) {
+            my $ready = $input;
+            last unless select($ready, undef, undef, $timeout) > 0;
+            last unless sysread(STDIN, my $byte, 1);
+            $timeout = 0.01;
+        }
+    ' "$1" 2> /dev/null
+}
+
 drain_pending_input() {
     local idle_timeout="${1:-0.01}"
     local between_timeout="0.01"
     # Bash 3.2 rejects fractional read timeouts, and read -t 0 never consumes
     # input. Use macOS's Perl for the short idle wait without changing TTY modes.
     if [[ "${BASH_VERSINFO[0]:-0}" -lt 4 ]]; then
-        if command -v perl > /dev/null 2>&1 && perl -MPOSIX=tcflush,TCIFLUSH -e '
-            my $timeout = shift;
-            if (-t STDIN) {
-                select undef, undef, undef, $timeout;
-                exit(defined(tcflush(fileno(STDIN), TCIFLUSH)) ? 0 : 1);
-            }
-            my $input = "";
-            vec($input, fileno(STDIN), 1) = 1;
-            for (1..101) {
-                my $ready = $input;
-                last unless select($ready, undef, undef, $timeout) > 0;
-                last unless sysread(STDIN, my $byte, 1);
-                $timeout = 0.01;
-            }
-        ' "$idle_timeout" 2> /dev/null; then
+        if _mole_drain_with_perl "$idle_timeout"; then
             return 0
         fi
-        # Best effort on hosts without Perl; integer reads still drain input.
+        # An integer read would block a terminal for a full second per call,
+        # so a terminal without Perl keeps its queue rather than stalling keys.
+        [[ -t 0 ]] && return 0
+        # Pipes have no keystrokes to delay; integer reads still drain them.
         idle_timeout="1"
         between_timeout="1"
     fi

@@ -133,6 +133,26 @@ EOF
 	[[ "$output" != *"Debug logging enabled"* ]]
 }
 
+@test "mole still answers version and help probes from a deleted cwd (#1679)" {
+	local vanished
+	vanished=$(mktemp -d "$HOME/cwd-probe.XXXXXX")
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" VANISHED="$vanished" /bin/bash --noprofile --norc <<'EOF'
+set -uo pipefail
+cd "$VANISHED"
+rmdir "$VANISHED"
+# install.sh and mo update verify a fresh install with these two probes.
+"$PROJECT_ROOT/mole" --version > "$HOME/probe-version.out" 2>&1; echo "VERSION_RC=$?"
+"$PROJECT_ROOT/mole" --help > "$HOME/probe-help.out" 2>&1; echo "HELP_RC=$?"
+"$PROJECT_ROOT/mole" clean --dry-run > /dev/null 2>&1; echo "CLEAN_RC=$?"
+EOF
+	[[ "$output" == *"VERSION_RC=0"* ]] || { echo "$output"; cat "$HOME/probe-version.out"; return 1; }
+	[[ "$output" == *"HELP_RC=0"* ]] || { echo "$output"; cat "$HOME/probe-help.out"; return 1; }
+	# Every other command keeps refusing an unknown working directory.
+	[[ "$output" == *"CLEAN_RC=1"* ]] || { echo "$output"; return 1; }
+	grep -q 'Mole version' "$HOME/probe-version.out" || return 1
+	! grep -q 'Cannot access the current directory' "$HOME/probe-version.out" || return 1
+}
+
 @test "mole --version reports script version" {
 	expected_version="$(grep '^VERSION=' "$PROJECT_ROOT/mole" | head -1 | sed 's/VERSION=\"\(.*\)\"/\1/')"
 	run env HOME="$HOME" "$PROJECT_ROOT/mole" --version
@@ -274,11 +294,11 @@ EOF
 	[ "$status" -eq 0 ] || return 1
 	[[ "$output" == *"U Update"* ]] || return 1
 
-	# TouchID setup takes precedence: no update shortcut even if one is ready.
+	# TouchID setup and an available update both retain their shortcuts.
 	run /bin/bash --noprofile --norc -c "MOLE_TEST_MODE=1 MOLE_SKIP_MAIN=1 HOME=\"\$(mktemp -d)\" source '$PROJECT_ROOT/mole'; _main_menu_controls_line false true"
 	[ "$status" -eq 0 ] || return 1
 	[[ "$output" == *"T TouchID"* ]] || return 1
-	[[ "$output" != *"U Update"* ]] || return 1
+	[[ "$output" == *"U Update"* ]] || return 1
 }
 
 @test "show_main_menu keeps history out of the primary menu" {
@@ -299,6 +319,46 @@ EOF
 	[[ "$output" == *"Clean        Free up disk space"* ]] || return 1
 	[[ "$output" != *"History"* ]] || return 1
 	[[ "$output" != *"history"* ]]
+}
+
+@test "show_main_menu sets the update notice off with a blank line and a green command" {
+	run /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+unset NO_COLOR
+HOME="$(mktemp -d)"
+export HOME MOLE_TEST_MODE=1 MOLE_SKIP_MAIN=1
+source "$PROJECT_ROOT/mole"
+[[ -n "$GREEN" && -n "$NC" ]] || exit 1
+show_menu_option() { printf '%s' "$2"; }
+line=$'\r\033[2K'
+render() {
+    MAIN_MENU_BANNER=""
+    MAIN_MENU_UPDATE_MESSAGE="$1"
+    MAIN_MENU_SHOW_UPDATE=true
+    show_main_menu 1 true
+}
+tagline="${GREEN}${MOLE_TAGLINE}${NC}"$'\n'
+
+# The real banner is used: command substitution strips its trailing blank line,
+# so the separator has to come from the notice itself.
+out="$(render 'Update 9.8.7 available, run mo update')"
+[[ "$out" == *"${tagline}${line}"$'\n'"${line}Update 9.8.7 available, run ${GREEN}mo update${NC}"$'\n'"${line}"$'\n'"${line}Clean"* ]] || { printf '%q\n' "$out"; exit 1; }
+out="$(render 'New nightly commit abc1234 available, run mo update --nightly')"
+[[ "$out" == *"${tagline}${line}"$'\n'"${line}New nightly commit abc1234 available, run ${GREEN}mo update --nightly${NC}"$'\n'"${line}"$'\n'"${line}Clean"* ]] || { printf '%q\n' "$out"; exit 1; }
+
+# Control: without a notice no extra rows appear between banner and options.
+out="$(render '')"
+[[ "$out" == *"${tagline}${line}"$'\n'"${line}Clean"* ]] || { printf '%q\n' "$out"; exit 1; }
+
+# Rendering must not rewrite the stored text: the idle refresh compares it
+# against the plain cache contents on every tick.
+MAIN_MENU_BANNER=""
+MAIN_MENU_UPDATE_MESSAGE='Update 9.8.7 available, run mo update'
+show_main_menu 1 true > /dev/null
+[[ "$MAIN_MENU_UPDATE_MESSAGE" == 'Update 9.8.7 available, run mo update' ]] || exit 1
+EOF
+
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
 }
 
 @test "interactive_main_menu ignores U shortcut when update notice is hidden" {
@@ -341,7 +401,7 @@ touch -t 200001010000 "$msg_cache"
 source "$PROJECT_ROOT/mole"
 message="$(read_update_message_cache "$msg_cache")"
 [[ -z "$message" ]] || exit 1
-[[ ! -s "$msg_cache" ]] || exit 1
+[[ -s "$msg_cache" ]] || exit 1
 EOF
 
 	[ "$status" -eq 0 ]
@@ -367,6 +427,49 @@ EOF
 
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"UPDATE_CALLED"* ]]
+}
+
+@test "interactive_main_menu quits on EOF but keeps running through idle ticks" {
+	# The body runs from a file: Bash 3.2 misreads a script fed on stdin once a
+	# function returns from inside a loop here, replaying the tail of a comment.
+	cat > "$BATS_TEST_TMPDIR/menu-eof.sh" <<'EOF'
+set -euo pipefail
+HOME="$(mktemp -d)"
+export HOME PROJECT_ROOT MOLE_TEST_MODE=1 MOLE_SKIP_MAIN=1
+script='source "$PROJECT_ROOT/mole"; show_main_menu() { :; }; hide_cursor() { :; }; show_cursor() { :; }; drain_pending_input() { :; }; interactive_main_menu'
+
+# Wait up to eight seconds for the background menu; a menu that is still alive
+# is killed and reported so a spinning loop cannot hang the suite.
+wait_for_menu() {
+    local pid="$1" _
+    for _ in $(seq 1 80); do
+        kill -0 "$pid" 2> /dev/null || return 0
+        sleep 0.1
+    done
+    kill -KILL "$pid" 2> /dev/null || true
+    wait "$pid" 2> /dev/null || true
+    return 1
+}
+
+# read_key tells an idle one-second tick from EOF only by elapsed time, and the
+# two need opposite handling: EOF must quit, a tick must keep the menu alive.
+/bin/bash --noprofile --norc -c "$script" < /dev/null > /dev/null 2>&1 &
+pid=$!
+wait_for_menu "$pid" || { echo "menu kept running after EOF"; exit 1; }
+wait "$pid" || { echo "menu exited non-zero on EOF"; exit 1; }
+
+# Control: stdin that stays open and idle for three seconds is not EOF, so the
+# menu must still be there after two idle ticks and quit once the pipe closes.
+/bin/bash --noprofile --norc -c "$script" < <(sleep 3) > /dev/null 2>&1 &
+pid=$!
+sleep 2
+kill -0 "$pid" 2> /dev/null || { echo "menu quit during an idle tick"; exit 1; }
+wait_for_menu "$pid" || { echo "menu kept running after the idle pipe closed"; exit 1; }
+wait "$pid" || { echo "menu exited non-zero after the idle pipe closed"; exit 1; }
+EOF
+
+	run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc "$BATS_TEST_TMPDIR/menu-eof.sh"
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
 }
 
 @test "interactive_main_menu drains numeric shortcut Enter before launching uninstall" {
@@ -818,8 +921,8 @@ PY
     done
 }
 
-@test "main menu restores terminal settings after Q and Ctrl-C" {
+@test "interactive terminal contract: menu restore, update notice wrapper and signals (PTY)" {
 	command -v python3 >/dev/null 2>&1 || skip "python3 not available"
 	run python3 "$PROJECT_ROOT/tests/main_menu_pty.py"
-	[ "$status" -eq 0 ]
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
 }

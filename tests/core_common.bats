@@ -331,7 +331,7 @@ EOF
     run /bin/bash --noprofile --norc <<'EOF'
 export MOLE_BASE_LOADED=1
 source "$PROJECT_ROOT/lib/core/ui.sh"
-perl() { return 127; }
+_mole_drain_with_perl() { return 127; }
 printf 'pending\n' | {
     drain_pending_input
     if IFS= read -r -s -n 1 -t 1 remaining; then
@@ -390,6 +390,44 @@ PY
     [ "$status" -eq 0 ]
 }
 
+@test "drain_pending_input does not stall a terminal when Perl fails" {
+    run python3 - <<'PY'
+import os
+import pty
+import subprocess
+import time
+
+script = '''
+export MOLE_BASE_LOADED=1
+source "$PROJECT_ROOT/lib/core/ui.sh"
+_mole_drain_with_perl() { return 127; }
+for ((i=0; i<3; i++)); do drain_pending_input; done
+printf 'DONE\\n'
+'''
+master, slave = pty.openpty()
+process = None
+try:
+    started = time.monotonic()
+    process = subprocess.Popen(
+        ["/bin/bash", "--noprofile", "--norc", "-c", script],
+        stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    stdout, stderr = process.communicate(timeout=10)
+    elapsed = time.monotonic() - started
+    assert process.returncode == 0, (stdout, stderr)
+    assert stdout == b"DONE\n", (stdout, stderr)
+    # The integer fallback blocks one second per call on an idle terminal.
+    assert elapsed < 1.5, elapsed
+finally:
+    if process is not None and process.poll() is None:
+        process.kill()
+        process.wait()
+    os.close(master)
+    os.close(slave)
+PY
+    [ "$status" -eq 0 ]
+}
+
 @test "drain_pending_input clears terminal input and preserves terminal settings" {
     run python3 - <<'PY'
 import os
@@ -438,6 +476,64 @@ for pending in [b"\n", b"\x1b[A"]:
         os.close(slave)
 PY
     [ "$status" -eq 0 ]
+}
+
+@test "mole_ascii_lowercase matches LC_ALL=C tr byte for byte" {
+    run /bin/bash --noprofile --norc << 'EOF'
+source "$PROJECT_ROOT/lib/core/common.sh"
+while IFS= read -r sample; do
+    expected=$(printf '%s' "$sample" | LC_ALL=C tr '[:upper:]' '[:lower:]')
+    actual=""
+    mole_ascii_lowercase actual "$sample"
+    [[ "$actual" == "$expected" ]] || { printf 'MISMATCH [%s] [%s] [%s]\n' "$sample" "$actual" "$expected"; exit 1; }
+done << 'SAMPLES'
+com.Apple.SystemSettings
+Zed Nightly
+ÄÖÜ Café ÉCOLE
+微信 WeChat
+[A-Z]*?{Glob}
+  Leading And Trailing  
+
+SAMPLES
+echo OK
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ "$output" = OK ]
+}
+
+@test "is_root_user answers from EUID without forking id" {
+    run /bin/bash --noprofile --norc << 'EOF'
+source "$PROJECT_ROOT/lib/core/common.sh"
+id() { echo called >> "$HOME/id-calls"; command id "$@"; }
+rc=0
+is_root_user || rc=$?
+expected=1
+[[ "$(command id -u)" == "0" ]] && expected=0
+[[ $rc -eq $expected ]] || { echo "RC=$rc EXPECTED=$expected"; exit 1; }
+[[ ! -e "$HOME/id-calls" ]] || { echo "FORKED_ID"; exit 1; }
+echo OK
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ "$output" = OK ]
+}
+
+@test "is_critical_system_component ignores case and leaves nocasematch as it was" {
+    run /bin/bash --noprofile --norc << 'EOF'
+source "$PROJECT_ROOT/lib/core/common.sh"
+for token in com.apple.SystemSettings "System Preferences" LoginItems com.apple.TCC ControlCenter; do
+    is_critical_system_component "$token" || { echo "MISSED $token"; exit 1; }
+done
+for token in com.example.app Slack "Visual Studio Code"; do
+    ! is_critical_system_component "$token" || { echo "FLAGGED $token"; exit 1; }
+done
+shopt -q nocasematch && { echo "LEFT_ON"; exit 1; }
+shopt -s nocasematch
+is_critical_system_component "LoginItems" || exit 1
+shopt -q nocasematch || { echo "TURNED_OFF"; exit 1; }
+echo OK
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ "$output" = OK ]
 }
 
 @test "bytes_to_human converts byte counts into readable units" {
@@ -492,6 +588,34 @@ EOF
     )"
 
     # Captured output is not a TTY, so no OSC 8 escapes may leak into pipes.
+    # shellcheck disable=SC2088  # literal tilde is the expected display form
+    [ "$output" = "~"'/Library/Application Support/MobileSync/Backup' ]
+}
+
+@test "format_path_link shows a short label inside a link to the full path" {
+    output="$(
+        HOME="$HOME" MOLE_ANSI_SUPPORTED_CACHE=0 /bin/bash --noprofile --norc << 'EOF'
+source "$PROJECT_ROOT/lib/core/common.sh"
+format_path_link "$HOME/Library/Application Support/MobileSync/Backup" "…/MobileSync/Backup"
+EOF
+    )"
+
+    local st=$'\033\\'
+    local expected_link="]8;;file://$HOME/Library/Application%20Support/MobileSync/Backup${st}"
+    [[ "$output" == *"$expected_link…/MobileSync/Backup"$'\033'* ]] || { printf '%q\n' "$output"; return 1; }
+    [[ "$output" != *"${st}~/Library"* ]] || { printf '%q\n' "$output"; return 1; }
+}
+
+@test "format_path_link keeps the full path in plain text despite a short label" {
+    output="$(
+        HOME="$HOME" /bin/bash --noprofile --norc << 'EOF'
+source "$PROJECT_ROOT/lib/core/common.sh"
+format_path_link "$HOME/Library/Application Support/MobileSync/Backup" "…/MobileSync/Backup"
+printf '\n'
+EOF
+    )"
+
+    # Without a link nothing carries the full path, so the label is ignored.
     # shellcheck disable=SC2088  # literal tilde is the expected display form
     [ "$output" = "~"'/Library/Application Support/MobileSync/Backup' ]
 }
@@ -942,6 +1066,54 @@ EOF
     # itself instead of being retuned blind.
     [[ "$raw_content" == *"Scanning items... 5/10"* ]] || { cat -v "$raw"; return 1; }
     [[ "$raw_content" == *"PID_STABLE"* ]] || { cat -v "$raw"; return 1; }
+}
+
+@test "update_progress_if_needed reads the epoch clock once per shell" {
+    local calls="$HOME/epoch-calls"
+    local spins="$HOME/spinner-text"
+    # shellcheck disable=SC2016  # inner bash expands these from its environment
+    run env PROJECT_ROOT="$PROJECT_ROOT" CALLS="$calls" SPINS="$spins" \
+        /bin/bash --noprofile --norc -c '
+            source "$PROJECT_ROOT/lib/core/common.sh"
+            get_epoch_seconds() { printf "x\n" >> "$CALLS"; echo 1000000; }
+            start_section_spinner() { printf "%s\n" "$1" >> "$SPINS"; }
+            last_tick=0
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+                update_progress_if_needed "$i" 10 last_tick 60 || true
+            done
+            echo "last_tick=$last_tick"
+        '
+    [ "$status" -eq 0 ]
+    [[ "$(wc -l < "$calls" | tr -d ' ')" == "1" ]] || return 1
+    [[ "$(cat "$spins")" == "Scanning items... 1/10" ]] || return 1
+    [[ "$output" == "last_tick=1000000" || "$output" == "last_tick=1000001" ]]
+}
+
+@test "update_progress_if_needed lets the shell clock advance the throttle" {
+    local spins="$HOME/spinner-advance"
+    # The epoch is read once and frozen by the stub, so only $SECONDS can move
+    # the clock. Jump it instead of sleeping: the throttle must hold inside the
+    # interval, then fire once the clock passes it.
+    # shellcheck disable=SC2016  # inner bash expands these from its environment
+    run env PROJECT_ROOT="$PROJECT_ROOT" SPINS="$spins" \
+        /bin/bash --noprofile --norc -c '
+            source "$PROJECT_ROOT/lib/core/common.sh"
+            get_epoch_seconds() { echo 1000000; }
+            start_section_spinner() { printf "%s\n" "$1" >> "$SPINS"; }
+            SECONDS=100
+            last_tick=0
+            update_progress_if_needed 1 10 last_tick 60 || exit 11
+            rc=0
+            update_progress_if_needed 2 10 last_tick 60 || rc=$?
+            [[ $rc -eq 1 ]] || exit 12
+            SECONDS=$((SECONDS + 100))
+            update_progress_if_needed 3 10 last_tick 60 || exit 13
+            echo "last_tick=$last_tick"
+        '
+    [ "$status" -eq 0 ] || { echo "status=$status"; return 1; }
+    [[ "$output" =~ ^last_tick=[0-9]+$ ]] || return 1
+    [ "${output#last_tick=}" -ge 1000100 ] || return 1
+    [[ "$(cat "$spins")" == $'Scanning items... 1/10\nScanning items... 3/10' ]]
 }
 
 @test "safe_clear_lines emits the same erase sequence per line to the target device" {
