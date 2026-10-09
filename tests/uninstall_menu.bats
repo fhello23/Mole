@@ -50,6 +50,21 @@ run_selector() {
     [[ "$output" != *'invalid format'* ]] || return 1
 }
 
+@test "uninstall search header shows queries that look like echo options" {
+    run_selector CHAR:/ CHAR:- CHAR:n ENTER
+    run cat "$MENU_OUTPUT"
+    [[ "$output" == *'/ Search: -n'* ]] || return 1
+}
+
+@test "uninstall search header keeps the end of a long query visible" {
+    COLUMNS=40 run_selector CHAR:/ CHAR:a CHAR:b CHAR:c CHAR:d CHAR:e CHAR:f CHAR:g CHAR:h CHAR:i \
+        CHAR:j CHAR:k CHAR:l CHAR:m CHAR:n CHAR:o CHAR:p CHAR:q ENTER
+    run cat "$MENU_OUTPUT"
+    # 40 columns leave 11 for "(0/5; 0 selected)" plus the query: "..." and 8 characters.
+    [[ "$output" == *'/ Search: ...jklmnopq'$'\033'* ]] || return 1
+    [[ "$output" != *'/ Search: abcdefgh...'* ]] || return 1
+}
+
 @test "uninstall preserves selected app identities across sorting and searching" {
     run_selector CHAR:s SPACE CHAR:o CHAR:/ CHAR:v CHAR:i CHAR:s ENTER SPACE QUIT ENTER
     [[ "$output" == *"SELECTED=/fixture/Alpha.app"* ]] || return 1

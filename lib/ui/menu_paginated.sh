@@ -494,8 +494,16 @@ paginated_multi_select() {
             [[ "$cols" =~ ^[0-9]+$ ]] || cols=80
             local query_width=$((cols - ${#counts} - ${#marker} - 12))
             ((query_width < 1)) && query_width=1
-            local query_display
-            query_display=$(truncate_by_display_width "$filter_text" "$query_width")
+            # Keep the newest characters of a long query visible while typing.
+            local query_display="$filter_text" query_len
+            query_len=$(get_display_width "$query_display")
+            if ((query_len > query_width)); then
+                query_display="${query_display:$((query_len - query_width + 3))}"
+                while [[ -n "$query_display" ]] && (($(get_display_width "$query_display") + 3 > query_width)); do
+                    query_display="${query_display:1}"
+                done
+                query_display="...$query_display"
+            fi
             printf "\r\033[2K${YELLOW}/ Search: %s%s${NC}  ${GRAY}%s${NC}\n" "$query_display" "$marker" "$counts" >&2
         elif [[ -n "${MOLE_READ_KEY_FORCE_CHAR:-}" ]]; then
             printf "\r\033[2K${YELLOW}/ Search: _ ${NC}${GRAY}(type to search)${NC}\n" >&2
