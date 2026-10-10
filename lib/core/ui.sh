@@ -164,20 +164,6 @@ truncate_by_display_width() {
     printf '%s...\n' "$truncated"
 }
 
-# Consume the rest of an unrecognized CSI sequence (Shift+arrow, F-keys), up
-# to its final byte (0x40-0x7E), without draining unrelated typed or pasted keys.
-_read_key_discard_csi() {
-    local byte="$1" code n=0
-    while ((n < 16)); do
-        [[ -z "$byte" ]] && return 0
-        printf -v code '%d' "'$byte" 2> /dev/null || return 0
-        ((code >= 64 && code <= 126)) && return 0
-        IFS= read -r -s -n 1 -t 1 byte 2> /dev/null || return 0
-        n=$((n + 1))
-    done
-    return 0
-}
-
 # Read single keyboard input
 read_key() {
     local key rest read_status
@@ -213,27 +199,19 @@ read_key() {
                     H) echo "TOP" ;;
                     F) echo "BOTTOM" ;;
                     1 | 3 | 4 | 5 | 6 | 7 | 8)
-                        if [[ "$rest" == "[" ]] && IFS= read -r -s -n 1 -t 1 terminator 2> /dev/null; then
-                            if [[ "$terminator" == "~" ]]; then
-                                case "$sequence" in
-                                    1 | 7) echo "TOP" ;;
-                                    4 | 8) echo "BOTTOM" ;;
-                                    5) echo "LEFT" ;;
-                                    6) echo "RIGHT" ;;
-                                    3) echo "DELETE" ;;
-                                esac
-                            else
-                                _read_key_discard_csi "$terminator"
-                                echo "OTHER"
-                            fi
+                        if [[ "$rest" == "[" ]] && IFS= read -r -s -n 1 -t 1 terminator 2> /dev/null && [[ "$terminator" == "~" ]]; then
+                            case "$sequence" in
+                                1 | 7) echo "TOP" ;;
+                                4 | 8) echo "BOTTOM" ;;
+                                5) echo "LEFT" ;;
+                                6) echo "RIGHT" ;;
+                                3) echo "DELETE" ;;
+                            esac
                         else
                             echo "OTHER"
                         fi
                         ;;
-                    *)
-                        [[ "$rest" == "[" ]] && _read_key_discard_csi "$sequence"
-                        echo "OTHER"
-                        ;;
+                    *) echo "OTHER" ;;
                 esac
             fi
         elif [[ "${MOLE_READ_KEY_FORCE_CHAR:-}" == "1" ]]; then

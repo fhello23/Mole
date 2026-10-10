@@ -98,9 +98,11 @@ def check_menu(columns):
             assert process.wait(timeout=3) == 0
         finally:
             if process.poll() is None:
-                os.killpg(process.pid, signal.SIGTERM)
                 try:
+                    os.killpg(process.pid, signal.SIGTERM)
                     process.wait(timeout=3)
+                except (ProcessLookupError, PermissionError):
+                    pass
                 except subprocess.TimeoutExpired:
                     os.killpg(process.pid, signal.SIGKILL)
                     process.wait(timeout=3)

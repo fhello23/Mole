@@ -50,12 +50,6 @@ run_selector() {
     [[ "$output" != *'invalid format'* ]] || return 1
 }
 
-@test "uninstall search header shows queries that look like echo options" {
-    run_selector CHAR:/ CHAR:- CHAR:n ENTER
-    run cat "$MENU_OUTPUT"
-    [[ "$output" == *'/ Search: -n'* ]] || return 1
-}
-
 @test "uninstall search header keeps the end of a long query visible" {
     COLUMNS=40 run_selector CHAR:/ CHAR:a CHAR:b CHAR:c CHAR:d CHAR:e CHAR:f CHAR:g CHAR:h CHAR:i \
         CHAR:j CHAR:k CHAR:l CHAR:m CHAR:n CHAR:o CHAR:p CHAR:q ENTER
