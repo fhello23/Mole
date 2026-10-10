@@ -97,16 +97,31 @@ def check_menu(columns):
             assert b'SELECTED=/fixture/Alpha.app' not in result, plain(result)
             assert process.wait(timeout=3) == 0
         finally:
-            if process.poll() is None:
-                try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                    process.wait(timeout=3)
-                except (ProcessLookupError, PermissionError):
-                    pass
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait(timeout=3)
-            os.close(master)
+            try:
+                stop(process)
+            finally:
+                os.close(master)
+
+
+def stop(process):
+    # Cleanup must not bury the assertion that brought us here. killpg can
+    # fail with EPERM on macOS once part of the group has exited, so fall
+    # back to the fixture itself.
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if process.poll() is not None:
+            return
+        try:
+            os.killpg(process.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            try:
+                process.send_signal(sig)
+            except ProcessLookupError:
+                return
+        try:
+            process.wait(timeout=3)
+            return
+        except subprocess.TimeoutExpired:
+            continue
 
 
 for terminal_width in (40, 60, 80, 120):
