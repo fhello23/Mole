@@ -213,12 +213,19 @@ debug_log() {
     fi
 }
 
+# Global-return form for row renderers; byte matching leaves UTF-8 intact.
+mole_terminal_safe_text_value() {
+    local value="${1:-}" LC_ALL=C
+    value=${value//$'\r'/ }
+    value=${value//$'\n'/ }
+    value=${value//$'\t'/ }
+    local controls=$'[\001-\010\013\014\016-\037\177]'
+    MOLE_TERMINAL_SAFE_TEXT=${value//$controls/?}
+}
+
 mole_terminal_safe_text() {
-    local value="${1:-}"
-    value=$(printf '%s' "$value" |
-        LC_ALL=C tr '\r\n\t' '   ' |
-        LC_ALL=C tr '\001-\010\013\014\016-\037\177' '?') || value=""
-    printf '%s' "$value"
+    mole_terminal_safe_text_value "${1:-}"
+    printf '%s' "$MOLE_TERMINAL_SAFE_TEXT"
 }
 
 # Phase-level performance timing, gated behind MO_DEBUG=1.

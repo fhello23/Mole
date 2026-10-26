@@ -4133,6 +4133,146 @@ get_path_size_kb() {
     fi
 }
 
+# Size an argv list, preserving its order without serializing path names.
+# Usage: get_paths_size_kb TIMEOUT MODE PATH...; empty timeout/mode use defaults.
+# TIMEOUT is one shared batch budget covering all stages and fallbacks.
+# Results are MOLE_PATH_SIZES_KB and MOLE_PATH_SIZE_STATUSES (ordinary errors
+# are per-path). A timeout/signal returns that status and publishes no results.
+# Call directly, not through $(); single-path callers keep get_path_size_kb.
+get_paths_size_kb() {
+    MOLE_PATH_SIZES_KB=()
+    MOLE_PATH_SIZE_STATUSES=()
+    [[ $# -ge 2 ]] || return 1
+    local -a batch_sizes=() batch_statuses=()
+    _mole_get_paths_size_kb "$@" || return $?
+    MOLE_PATH_SIZES_KB=("${batch_sizes[@]+"${batch_sizes[@]}"}")
+    MOLE_PATH_SIZE_STATUSES=("${batch_statuses[@]+"${batch_statuses[@]}"}")
+}
+
+# The result arrays are local to the public wrapper until all probes finish.
+_mole_get_paths_size_kb() {
+    local size_timeout="${1:-$MOLE_TIMEOUT_DISK_VERIFY_SEC}" size_mode="${2:-}"
+    shift 2
+    if [[ ! "$size_timeout" =~ ^[0-9]+(\.[0-9]+)?$ || "$size_timeout" =~ ^0+(\.0+)?$ ]]; then
+        size_timeout="$MOLE_TIMEOUT_DISK_VERIFY_SEC"
+    fi
+    local whole="${size_timeout%%.*}"
+    local budget=$((10#$whole))
+    if [[ "$size_timeout" == *.* && "${size_timeout#*.}" =~ [1-9] ]]; then
+        budget=$((budget + 1))
+    fi
+    [[ $budget -gt 0 ]] || budget=1
+    local deadline=$((SECONDS + budget))
+    local -a paths=("$@") probe_files=() file_indices=() dirs=() dir_indices=() fallback=() values=()
+    local path index=0 rc=0 duration output value record valid
+    for path in "$@"; do
+        batch_sizes[index]=0
+        batch_statuses[index]=0
+        if [[ -n "$path" && -e "$path" ]]; then
+            # Both find and metadata tools must see leading dashes as operands.
+            [[ "$path" == /* ]] || path="./$path"
+            paths[index]="$path"
+            if [[ "$path" == *.[aA][pP][pP] || "$path" == *.[aA][pP][pP]/ ]]; then
+                # mdls -raw has no reliable per-operand record on missing or
+                # unindexed metadata. Keep its physical-size/fallback contract.
+                fallback+=("$index")
+            elif [[ -f "$path" || -L "$path" ]]; then
+                probe_files+=("$path")
+                file_indices+=("$index")
+            elif [[ -d "$path" ]]; then
+                dirs+=("$path")
+                dir_indices+=("$index")
+            else
+                fallback+=("$index")
+            fi
+        fi
+        index=$((index + 1))
+    done
+
+    if [[ ${#probe_files[@]} -gt 0 ]]; then
+        duration=$(_mole_timeout_with_deadline "$size_timeout" "$deadline") || return $?
+        output=$(run_with_timeout "$duration" "$STAT_BSD" -f%b "${probe_files[@]}" < /dev/null 2> /dev/null) || rc=$?
+        mole_rc_timeout_or_signal "$rc" && return "$rc"
+        valid=true
+        values=()
+        while IFS= read -r value; do
+            [[ "$value" =~ ^[0-9]+$ ]] || valid=false
+            values+=("$value")
+        done <<< "$output"
+        if [[ $rc -eq 0 && "$valid" == true && ${#values[@]} -eq ${#probe_files[@]} ]]; then
+            for index in "${!file_indices[@]}"; do
+                batch_sizes[file_indices[index]]=$(((values[index] + 1) / 2))
+            done
+        else
+            # stat omits failed operands; discard the entire positional result
+            # before resolving those paths separately (including du fallback).
+            fallback+=("${file_indices[@]}")
+        fi
+    fi
+
+    if [[ ${#dirs[@]} -gt 0 ]]; then
+        rc=0
+        output=""
+        if [[ ${#dirs[@]} -gt 1 ]]; then
+            # BSD du shares its hardlink ledger across operands. Only batch
+            # trees without hardlinked entries; -l would also change internal
+            # hardlink accounting. Unreadable scans fall back per path.
+            duration=$(_mole_timeout_with_deadline "$size_timeout" "$deadline") || return $?
+            output=$(run_with_timeout "$duration" "$FIND_BSD" "${dirs[@]}" \
+                ! -type d -links +1 -print -quit < /dev/null 2> /dev/null) || rc=$?
+            mole_rc_timeout_or_signal "$rc" && return "$rc"
+        fi
+        if [[ $rc -ne 0 || -n "$output" ]]; then
+            fallback+=("${dir_indices[@]}")
+        else
+            duration=$(_mole_timeout_with_deadline "$size_timeout" "$deadline") || return $?
+            # The sentinel preserves all trailing newlines, including those in
+            # the last path. Consume exact argv suffixes, never split filenames
+            # on tabs/newlines or interpret them as patterns.
+            output=$(
+                probe_rc=0
+                run_with_timeout "$duration" du -skP "${dirs[@]}" < /dev/null 2> /dev/null || probe_rc=$?
+                printf '.'
+                exit "$probe_rc"
+            ) || rc=$?
+            mole_rc_timeout_or_signal "$rc" && return "$rc"
+            output=${output%.}
+            values=()
+            valid=true
+            for path in "${dirs[@]}"; do
+                value=${output%%$'\t'*}
+                record="$value"$'\t'"$path"$'\n'
+                if [[ ! "$value" =~ ^[0-9]+$ || "$output" != "$record"* ]]; then
+                    valid=false
+                    break
+                fi
+                values+=("$value")
+                output=${output#"$record"}
+            done
+            if [[ "$valid" == true && -z "$output" ]] &&
+                { [[ $rc -eq 0 ]] || [[ $rc -eq 1 && "$size_mode" == readable ]]; }; then
+                for index in "${!dir_indices[@]}"; do
+                    batch_sizes[dir_indices[index]]=${values[index]}
+                done
+            else
+                fallback+=("${dir_indices[@]}")
+            fi
+        fi
+    fi
+
+    for index in "${fallback[@]+"${fallback[@]}"}"; do
+        duration=$(_mole_timeout_with_deadline "$size_timeout" "$deadline") || return $?
+        rc=0
+        value=$(get_path_size_kb "${paths[index]}" "$duration" "$size_mode") || rc=$?
+        mole_rc_timeout_or_signal "$rc" && return "$rc"
+        batch_statuses[index]=$rc
+        if [[ $rc -eq 0 && "$value" =~ ^[0-9]+$ ]]; then
+            batch_sizes[index]=$value
+        fi
+    done
+    return 0
+}
+
 # Add one reported cleanup row to the run totals: its item count, its KB, and
 # one category. Every section that prints its own result row goes through
 # here, so non-numeric input counts as zero instead of arithmetic on a name.
@@ -4181,12 +4321,9 @@ calculate_total_size() {
         [[ -z "$file" ]] || unique_paths+=("$file")
     done <<< "$filtered"
 
-    for file in "${unique_paths[@]+"${unique_paths[@]}"}"; do
-        local size_kb=0
-        local size_rc=0
-        size_kb=$(get_path_size_kb "$file") || size_rc=$?
-        mole_rc_timeout_or_signal "$size_rc" && return "$size_rc"
-        [[ $size_rc -eq 0 && "$size_kb" =~ ^[0-9]+$ ]] || size_kb=0
+    get_paths_size_kb "" "" "${unique_paths[@]+"${unique_paths[@]}"}" || return $?
+    local size_kb
+    for size_kb in "${MOLE_PATH_SIZES_KB[@]+"${MOLE_PATH_SIZES_KB[@]}"}"; do
         total_kb=$((total_kb + size_kb))
     done
 

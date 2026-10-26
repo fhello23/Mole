@@ -1,0 +1,72 @@
+C:30:0|...        -- | Unknown
+C:30:1|-n        -- | Yesterday
+C:30:2|...  1023.5MB | 3m ago
+C:30:3|...     Steam | 12w ago
+C:30:4|...        -- | This year
+C:30:5|...       5GB | a v...
+C:30:6|...        -- | Today
+C:30:7|...        -- | Unknown
+C:30:8|         1KB | Unknown
+C:40:0|App                 -- | Unknown
+C:40:1|-n                  -- | Yesterday
+C:40:2|中文应用...   1023.5MB | 3m ago
+C:40:3|Cafe...          Steam | 12w ago
+C:40:4|👩‍💻 ...         -- | This year
+C:40:5|bad?...            5GB | a v...
+C:40:6|A ve...             -- | Today
+C:40:7|back\slash          -- | Unknown
+C:40:8|                   1KB | Unknown
+C:80:0|App                                                         -- | Unknown
+C:80:1|-n                                                          -- | Yesterday
+C:80:2|中文应用程序很长很长                                  1023.5MB | 3m ago
+C:80:3|Café combine                                            Steam | 12w ago
+C:80:4|👩‍💻 Editor                                              -- | This year
+C:80:5|bad?[31m name end                                          5GB | a v...
+C:80:6|A very long application name with spaces                    -- | Today
+C:80:7|back\slash                                                  -- | Unknown
+C:80:8|                                                           1KB | Unknown
+C:120:0|App                                                                 -- | Unknown
+C:120:1|-n                                                                  -- | Yesterday
+C:120:2|中文应用程序很长很长                                          1023.5MB | 3m ago
+C:120:3|Café combine                                                    Steam | 12w ago
+C:120:4|👩‍💻 Editor                                                      -- | This year
+C:120:5|bad?[31m name end                                                  5GB | a v...
+C:120:6|A very long application name with spaces                            -- | Today
+C:120:7|back\slash                                                          -- | Unknown
+C:120:8|                                                                   1KB | Unknown
+en_US.UTF-8:30:0|...        -- | Unknown
+en_US.UTF-8:30:1|-n        -- | Yesterday
+en_US.UTF-8:30:2|...  1023.5MB | 3m ago
+en_US.UTF-8:30:3|...     Steam | 12w ago
+en_US.UTF-8:30:4|...        -- | This year
+en_US.UTF-8:30:5|...       5GB | a v...
+en_US.UTF-8:30:6|...        -- | Today
+en_US.UTF-8:30:7|...        -- | Unknown
+en_US.UTF-8:30:8|         1KB | Unknown
+en_US.UTF-8:40:0|App                 -- | Unknown
+en_US.UTF-8:40:1|-n                  -- | Yesterday
+en_US.UTF-8:40:2|中文应用...   1023.5MB | 3m ago
+en_US.UTF-8:40:3|Cafe...          Steam | 12w ago
+en_US.UTF-8:40:4|👩‍💻 ...         -- | This year
+en_US.UTF-8:40:5|bad?...            5GB | a v...
+en_US.UTF-8:40:6|A ve...             -- | Today
+en_US.UTF-8:40:7|back\slash          -- | Unknown
+en_US.UTF-8:40:8|                   1KB | Unknown
+en_US.UTF-8:80:0|App                                                         -- | Unknown
+en_US.UTF-8:80:1|-n                                                          -- | Yesterday
+en_US.UTF-8:80:2|中文应用程序很长很长                                  1023.5MB | 3m ago
+en_US.UTF-8:80:3|Café combine                                            Steam | 12w ago
+en_US.UTF-8:80:4|👩‍💻 Editor                                              -- | This year
+en_US.UTF-8:80:5|bad?[31m name end                                          5GB | a v...
+en_US.UTF-8:80:6|A very long application name with spaces                    -- | Today
+en_US.UTF-8:80:7|back\slash                                                  -- | Unknown
+en_US.UTF-8:80:8|                                                           1KB | Unknown
+en_US.UTF-8:120:0|App                                                                 -- | Unknown
+en_US.UTF-8:120:1|-n                                                                  -- | Yesterday
+en_US.UTF-8:120:2|中文应用程序很长很长                                          1023.5MB | 3m ago
+en_US.UTF-8:120:3|Café combine                                                    Steam | 12w ago
+en_US.UTF-8:120:4|👩‍💻 Editor                                                      -- | This year
+en_US.UTF-8:120:5|bad?[31m name end                                                  5GB | a v...
+en_US.UTF-8:120:6|A very long application name with spaces                            -- | Today
+en_US.UTF-8:120:7|back\slash                                                          -- | Unknown
+en_US.UTF-8:120:8|                                                                   1KB | Unknown

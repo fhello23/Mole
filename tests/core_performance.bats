@@ -285,3 +285,113 @@ EOF
     local limit_ms="${MOLE_PERF_SECTION_LIMIT_MS:-2000}"
     [ "$elapsed" -lt "$limit_ms" ]
 }
+
+@test "calculate_total_size batches allocated-block stat and timeout invocations" {
+    run /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+fixture=$(mktemp -d "$TEST_DATA_DIR/batch-size.XXXXXX")
+files=''
+for ((i=0; i<20; i++)); do touch "$fixture/$i"; files+="$fixture/$i"$'\n'; done
+stat_probe() {
+    printf 'stat\n' >> "$fixture/calls"
+    /usr/bin/stat "$@"
+}
+STAT_BSD=stat_probe
+run_with_timeout() {
+    printf 'timeout\n' >> "$fixture/calls"
+    shift
+    "$@"
+}
+[[ "$(calculate_total_size "$files")" == 0 ]] || exit 1
+stats=$(grep -c '^stat$' "$fixture/calls")
+timeouts=$(grep -c '^timeout$' "$fixture/calls")
+printf 'STAT=%s TIMEOUT=%s\n' "$stats" "$timeouts"
+[[ "$stats" == 1 && "$timeouts" == 1 ]] || exit 1
+SCRIPT
+    [ "$status" -eq 0 ] || { printf '%s\n' "$output"; return 1; }
+    [[ "$output" == "STAT=1 TIMEOUT=1" ]]
+}
+
+@test "app row formatting runs without command substitutions" {
+    run /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/ui/app_selector.sh"
+trace="$TEST_DATA_DIR/row-subshells"
+: > "$trace"
+export LC_ALL=C
+set -T
+trap 'if [[ $BASH_SUBSHELL -gt 0 ]]; then printf "subshell\n" >> "$trace"; fi' DEBUG
+format_app_display "中文 é Application" "12MB" "3 months ago" 80 25 > /dev/null
+format_app_display "中文应用程序名字很长很长" "12MB" "3 months ago" 40 8 > /dev/null
+[[ "$MOLE_APP_DISPLAY" == "中文..."* ]] || { printf 'row-not-truncated\n'; exit 1; }
+[[ "${LC_ALL-}" == C ]] || { printf 'row-changed-locale\n'; exit 1; }
+trap - DEBUG
+[[ ! -s "$trace" ]] || { printf 'row-created-subshells\n'; exit 1; }
+printf 'fork-free-row\n'
+SCRIPT
+    [ "$status" -eq 0 ] || { printf '%s\n' "$output"; return 1; }
+    [[ "$output" == "fork-free-row" ]]
+}
+
+@test "directory sizing batches du and bounded hardlink discovery" {
+    run /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+fixture=$(mktemp -d "$TEST_DATA_DIR/batch-dirs.XXXXXX")
+paths=()
+for ((i=0; i<20; i++)); do mkdir "$fixture/$i"; paths+=("$fixture/$i"); done
+run_with_timeout() {
+    shift
+    printf '%s\n' "${1##*/}" >> "$fixture/calls"
+    "$@"
+}
+get_paths_size_kb '' '' "${paths[@]}"
+[[ ${#MOLE_PATH_SIZES_KB[@]} == 20 ]] || exit 1
+[[ $(grep -c '^du$' "$fixture/calls") == 1 && $(grep -c '^find$' "$fixture/calls") == 1 ]] || exit 1
+[[ $(wc -l < "$fixture/calls") -eq 2 ]] || exit 1
+printf 'DU=1 FIND=1 TIMEOUT=2\n'
+SCRIPT
+    [ "$status" -eq 0 ] || { printf '%s\n' "$output"; return 1; }
+    [[ "$output" == "DU=1 FIND=1 TIMEOUT=2" ]]
+}
+
+@test "app selector computes terminal width once and formats rows in the render shell" {
+    run /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/uninstall.sh"
+fixture=$(mktemp -d "$TEST_DATA_DIR/selector.XXXXXX")
+for display_size in '' 0 Unknown '12MB' '-n' $'12MB\n'; do
+    expected=$(uninstall_normalize_size_display "$display_size" '')
+    uninstall_normalize_size_display "$display_size" '' actual
+    [[ "$actual" == "$expected" ]] || exit 1
+done
+apps_data=()
+for ((i=0; i<20; i++)); do
+    apps_data+=("1700000000|$fixture/$i.app|Application $i|com.example.$i|12MB|3 months ago|12000")
+done
+tput() { printf 'cols\n' >> "$fixture/cols"; printf '80\n'; }
+uninstall_app_is_steam_launcher() { [[ "$1" == */0.app ]]; }
+drain_pending_input() { :; }
+stop_inline_spinner() { :; }
+paginated_multi_select() {
+    shift
+    [[ $# == 20 ]] || exit 1
+    [[ "$1" == *'Steam | 3m ago' && "$2" == *'12MB | 3m ago' ]] || exit 1
+    MOLE_SELECTION_RESULT=0
+}
+# Count row entry points in the owning shell; $() would lose these counters.
+rows=0
+normalizations=0
+eval "$(declare -f format_app_display_value | sed '1s/format_app_display_value/original_format_app_display_value/')"
+format_app_display_value() { rows=$((rows+1)); original_format_app_display_value "$@"; }
+eval "$(declare -f uninstall_normalize_size_display | sed '1s/uninstall_normalize_size_display/original_normalize_size/')"
+uninstall_normalize_size_display() { normalizations=$((normalizations+1)); original_normalize_size "$@"; }
+select_apps_for_uninstall
+[[ "$rows" == 20 && "$normalizations" == 20 && $(wc -l < "$fixture/cols") -eq 1 ]] || exit 1
+printf 'ROWS=20 NORMALIZATIONS=20 COLS=1\n'
+SCRIPT
+    [ "$status" -eq 0 ] || { printf '%s\n' "$output"; return 1; }
+    [[ "$output" == "ROWS=20 NORMALIZATIONS=20 COLS=1" ]]
+}

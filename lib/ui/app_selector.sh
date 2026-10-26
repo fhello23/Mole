@@ -6,22 +6,29 @@ set -euo pipefail
 # Note: get_display_width() is now defined in lib/core/ui.sh
 
 # Format app info for display
-format_app_display() {
+format_app_display_value() {
     local display_name="$1" size="$2" last_used="$3"
 
     # Display names come from app bundles and can carry terminal control bytes.
     # This row is a rendering site only: apps_data keeps the stored name, and
     # matching, sizes and removal plans are untouched.
-    display_name=$(mole_terminal_safe_text "$display_name")
+    mole_terminal_safe_text_value "$display_name"
+    display_name=$MOLE_TERMINAL_SAFE_TEXT
 
     # Use common function from ui.sh to format last used time
     local compact_last_used
-    compact_last_used=$(format_last_used_summary "$last_used")
+    format_last_used_summary_value "$last_used"
+    compact_last_used=$MOLE_LAST_USED_SUMMARY
+    # Preserve echo-option and trailing-newline handling of the old $() call.
+    [[ ! "$compact_last_used" =~ ^-[eEn]+$ ]] || compact_last_used=""
+    while [[ "$compact_last_used" == *$'\n' ]]; do compact_last_used=${compact_last_used%$'\n'}; done
     if [[ -z "$compact_last_used" || "$compact_last_used" == "Never" ]]; then
         compact_last_used="Unknown"
     fi
-    if [[ $(get_display_width "$compact_last_used") -gt 9 ]]; then
-        compact_last_used=$(truncate_by_display_width "$compact_last_used" 9)
+    get_display_width_value "$compact_last_used"
+    if [[ $MOLE_DISPLAY_WIDTH -gt 9 ]]; then
+        truncate_by_display_width_value "$compact_last_used" 9
+        compact_last_used=$MOLE_TRUNCATED_TEXT
     fi
 
     # Format size. The selector column is %9s; list/json keep the long
@@ -68,11 +75,13 @@ format_app_display() {
 
     # Truncate long names if needed (based on display width, not char count)
     local truncated_name
-    truncated_name=$(truncate_by_display_width "$display_name" "$available_width")
+    truncate_by_display_width_value "$display_name" "$available_width"
+    truncated_name=$MOLE_TRUNCATED_TEXT
 
     # Get actual display width after truncation
     local current_display_width
-    current_display_width=$(get_display_width "$truncated_name")
+    get_display_width_value "$truncated_name"
+    current_display_width=$MOLE_DISPLAY_WIDTH
 
     # Calculate padding needed
     # printf counts bytes (in LC_ALL=C), not display width or char count.
@@ -90,7 +99,13 @@ format_app_display() {
     local printf_width=$((byte_count + padding_needed))
 
     # Use dynamic column width with corrected padding
-    printf "%-*s %9s | %s" "$printf_width" "$truncated_name" "$size_str" "$compact_last_used"
+    printf -v MOLE_APP_DISPLAY "%-*s %9s | %s" "$printf_width" "$truncated_name" "$size_str" "$compact_last_used"
+}
+
+# Keep the stdout API for standalone callers; menus use the value directly.
+format_app_display() {
+    format_app_display_value "$@"
+    printf '%s' "$MOLE_APP_DISPLAY"
 }
 
 # Global variable to store selection result (bash 3.2 compatible)
@@ -120,7 +135,8 @@ select_apps_for_uninstall() {
     local max_name_width=0
     for app_data in "${apps_data[@]}"; do
         IFS='|' read -r _ _ display_name _ _ _ _ <<< "$app_data"
-        local name_width=$(get_display_width "$display_name")
+        get_display_width_value "$display_name"
+        local name_width=$MOLE_DISPLAY_WIDTH
         [[ $name_width -gt $max_name_width ]] && max_name_width=$name_width
     done
     # Constrain based on terminal width: fixed=28 (prefix 4-6 + space 1 + size 9 + sep 3 + max_last 9)
@@ -154,9 +170,10 @@ select_apps_for_uninstall() {
         IFS='|' read -r epoch app_path display_name _ size last_used size_kb <<< "$app_data"
         size_display="$size"
         if declare -f uninstall_normalize_size_display > /dev/null 2>&1; then
-            size_display=$(uninstall_normalize_size_display "$size" "$app_path")
+            uninstall_normalize_size_display "$size" "$app_path" size_display
         fi
-        menu_options+=("$(format_app_display "$display_name" "$size_display" "$last_used" "$terminal_width" "$max_name_width")")
+        format_app_display_value "$display_name" "$size_display" "$last_used" "$terminal_width" "$max_name_width"
+        menu_options+=("$MOLE_APP_DISPLAY")
         [[ "${epoch:-0}" =~ ^[0-9]+$ && "${epoch:-0}" -gt 0 ]] && has_epoch_metadata=true
         [[ "${size_kb:-0}" =~ ^[0-9]+$ && "${size_kb:-0}" -gt 0 ]] && has_size_metadata=true
         if [[ $idx -eq 0 ]]; then

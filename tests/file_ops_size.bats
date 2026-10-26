@@ -459,3 +459,218 @@ EOF
     [[ "$output" == *"RC=124"* ]] || { echo "$output"; return 1; }
     [[ "$output" == *"DEBUG: Size check timed out after 7s: $SANDBOX/slow-dir"* ]] || { echo "$output"; return 1; }
 }
+
+@test "batched sizing matches single-path values and statuses in argv order" {
+    run /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+cd "$SANDBOX"
+mkdir -p tree/sub Sized.app Unindexed.app partly-readable/locked
+printf payload > 'tree/sub/data'
+printf payload > $'file\nwith\ttabs '
+printf payload > ./-leading
+ln -s tree/sub/data link
+ln -s missing broken
+chmod 000 partly-readable/locked
+trap 'chmod 755 partly-readable/locked' EXIT
+run_with_timeout() {
+    shift
+    if [[ "$1" == mdls ]]; then
+        [[ "${!#}" != *Unindexed.app ]] || return 1
+        printf '5001\n'
+    else
+        "$@"
+    fi
+}
+paths=($'file\nwith\ttabs ' -leading link broken tree Sized.app Unindexed.app missing '' partly-readable)
+for mode in '' readable; do
+    get_paths_size_kb '' "$mode" "${paths[@]}"
+    [[ ${#MOLE_PATH_SIZES_KB[@]} -eq ${#paths[@]} ]] || exit 1
+    for i in "${!paths[@]}"; do
+        path=${paths[i]}
+        [[ -z "$path" ]] || path="./$path"
+        rc=0
+        expected=$(get_path_size_kb "$path" '' "$mode") || rc=$?
+        [[ "$rc" == "${MOLE_PATH_SIZE_STATUSES[i]}" ]] || exit 1
+        [[ -n "$expected" ]] || expected=0
+        [[ "$expected" == "${MOLE_PATH_SIZES_KB[i]}" ]] || exit 1
+    done
+    [[ ${MOLE_PATH_SIZES_KB[5]} == 5 ]] || exit 1
+    if [[ "$mode" == readable ]]; then
+        [[ ${MOLE_PATH_SIZE_STATUSES[9]} == 0 ]] || exit 1
+    else
+        [[ ${MOLE_PATH_SIZE_STATUSES[9]} == 1 ]] || exit 1
+    fi
+done
+printf 'ordered-equivalent\n'
+SCRIPT
+    [ "$status" -eq 0 ] || { printf '%s\n' "$output"; return 1; }
+    [[ "$output" == "ordered-equivalent" ]]
+}
+
+@test "batched directories preserve literal newline tabs and independent hardlinks" {
+    run /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+paths=("$SANDBOX/first" "$SANDBOX/"$'second\tline\n' "$SANDBOX/third")
+mkdir -p "${paths[@]}"
+dd if=/dev/urandom of="${paths[0]}/data" bs=4096 count=8 2>/dev/null
+ln "${paths[0]}/data" "${paths[0]}/internal"
+ln "${paths[0]}/data" "${paths[1]}/external"
+for pass in linked unlinked; do
+    get_paths_size_kb '' '' "${paths[@]}"
+    for i in "${!paths[@]}"; do
+        expected=$(get_path_size_kb "${paths[i]}")
+        [[ "${MOLE_PATH_SIZES_KB[i]}" == "$expected" && ${MOLE_PATH_SIZE_STATUSES[i]} == 0 ]] || exit 1
+    done
+    # SAFE: exact fixture links created above, removed to exercise the du batch too.
+    rm -f "${paths[0]}/internal" "${paths[1]}/external"
+done
+printf 'literal-paths-independent-hardlinks\n'
+SCRIPT
+    [ "$status" -eq 0 ] || { printf '%s\n' "$output"; return 1; }
+    [[ "$output" == "literal-paths-independent-hardlinks" ]]
+}
+
+@test "batched stat discards omitted or malformed records before per-path fallback" {
+    run /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+touch "$SANDBOX/a" "$SANDBOX/b"
+STAT_BSD=stat_probe
+stat_probe() {
+    printf 'stat:%s\n' "$#" >> "$SANDBOX/calls"
+    if [[ $# -gt 2 ]]; then
+        if [[ "$bad_mode" == malformed ]]; then printf 'junk\n999\n'; return 0; fi
+        printf '999\n'
+        return 1
+    fi
+    /usr/bin/stat "$@"
+}
+run_with_timeout() { shift; "$@"; }
+for bad_mode in omitted malformed; do
+    : > "$SANDBOX/calls"
+    get_paths_size_kb '' '' "$SANDBOX/a" "$SANDBOX/b"
+    [[ "${MOLE_PATH_SIZES_KB[*]}" == '0 0' && "${MOLE_PATH_SIZE_STATUSES[*]}" == '0 0' ]] || exit 1
+    [[ $(grep -c '^stat:3$' "$SANDBOX/calls") == 1 && $(grep -c '^stat:2$' "$SANDBOX/calls") == 2 ]] || exit 1
+done
+printf 'partial-discarded-fallback-reached\n'
+SCRIPT
+    [ "$status" -eq 0 ] || { printf '%s\n' "$output"; return 1; }
+    [[ "$output" == "partial-discarded-fallback-reached" ]]
+}
+
+@test "batched du discards swapped records before per-path fallback" {
+    run /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+mkdir "$SANDBOX/a" "$SANDBOX/b"
+run_with_timeout() {
+    shift
+    case "$1" in
+        "$FIND_BSD") return 0 ;;
+        du)
+            shift 2
+            if [[ $# -eq 2 ]]; then
+                printf 'batch\n' >> "$SANDBOX/calls"
+                printf '222\t%s\n111\t%s\n' "$2" "$1"
+            else
+                printf 'single:%s\n' "${1##*/}" >> "$SANDBOX/calls"
+                case "$1" in
+                    "$SANDBOX/a") printf '111\t%s\n' "$1" ;;
+                    "$SANDBOX/b") printf '222\t%s\n' "$1" ;;
+                    *) return 99 ;;
+                esac
+            fi
+            ;;
+        *) "$@" ;;
+    esac
+}
+get_paths_size_kb '' '' "$SANDBOX/a" "$SANDBOX/b"
+[[ "${MOLE_PATH_SIZES_KB[*]}" == '111 222' && "${MOLE_PATH_SIZE_STATUSES[*]}" == '0 0' ]] || exit 1
+[[ $(< "$SANDBOX/calls") == $'batch\nsingle:a\nsingle:b' ]] || exit 1
+printf 'swapped-discarded-fallback-reached\n'
+SCRIPT
+    [ "$status" -eq 0 ] || { printf '%s\n' "$output"; return 1; }
+    [[ "$output" == "swapped-discarded-fallback-reached" ]]
+}
+
+@test "batched du accepts readable rc1 totals but resolves strict errors per path" {
+    run /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+mkdir "$SANDBOX/a" "$SANDBOX/b"
+run_with_timeout() {
+    shift
+    case "$1" in
+        "$FIND_BSD") return 0 ;;
+        du)
+            shift 2
+            for path in "$@"; do printf '777\t%s\n' "$path"; done
+            return 1 ;;
+        *) "$@" ;;
+    esac
+}
+get_paths_size_kb '' readable "$SANDBOX/a" "$SANDBOX/b"
+[[ "${MOLE_PATH_SIZES_KB[*]}" == '777 777' && "${MOLE_PATH_SIZE_STATUSES[*]}" == '0 0' ]] || exit 1
+get_paths_size_kb '' '' "$SANDBOX/a" "$SANDBOX/b"
+[[ "${MOLE_PATH_SIZES_KB[*]}" == '0 0' && "${MOLE_PATH_SIZE_STATUSES[*]}" == '1 1' ]] || exit 1
+printf 'readable-and-strict\n'
+SCRIPT
+    [ "$status" -eq 0 ] || { printf '%s\n' "$output"; return 1; }
+    [[ "$output" == "readable-and-strict" ]]
+}
+
+@test "batched sizing discards results and stops later probes on timeout or signal" {
+    run /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+touch "$SANDBOX/file"
+mkdir "$SANDBOX/a" "$SANDBOX/b" "$SANDBOX/Later.app"
+run_with_timeout() {
+    shift
+    local kind=${1##*/}
+    printf '%s\n' "$kind" >> "$SANDBOX/calls"
+    if [[ "$kind" == "$failing" ]]; then
+        printf '999\tpartial\n'
+        return "$failure"
+    fi
+    case "$kind" in
+        find) return 0 ;;
+        *) "$@" ;;
+    esac
+}
+for failing in stat find du mdls; do
+    for failure in 124 130 137 143; do
+        : > "$SANDBOX/calls"
+        MOLE_PATH_SIZES_KB=(stale)
+        MOLE_PATH_SIZE_STATUSES=(stale)
+        rc=0
+        get_paths_size_kb '' readable "$SANDBOX/file" "$SANDBOX/a" "$SANDBOX/b" "$SANDBOX/Later.app" || rc=$?
+        printf '%s:%s=%s\n' "$failing" "$failure" "$rc"
+        [[ $rc == "$failure" && ${#MOLE_PATH_SIZES_KB[@]} == 0 && ${#MOLE_PATH_SIZE_STATUSES[@]} == 0 ]] || exit 1
+        grep -qx "$failing" "$SANDBOX/calls" || exit 1
+        if [[ "$failing" != mdls ]]; then
+            [[ $(grep -c '^mdls$' "$SANDBOX/calls") == 0 ]] || exit 1
+        fi
+    done
+done
+SCRIPT
+    [ "$status" -eq 0 ] || { printf '%s\n' "$output"; return 1; }
+    [[ "$output" == *"stat:124=124"* && "$output" == *"mdls:143=143"* ]]
+}
+
+@test "calculate_total_size propagates a batch timeout without a zero total" {
+    run /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+touch "$SANDBOX/file"
+run_with_timeout() { printf 'probe\n' >> "$SANDBOX/calls"; return 124; }
+rc=0
+value=$(calculate_total_size "$SANDBOX/file") || rc=$?
+printf 'RC=%s SIZE=[%s]\n' "$rc" "$value"
+[[ $rc == 124 && -z "$value" && -s "$SANDBOX/calls" ]] || exit 1
+SCRIPT
+    [ "$status" -eq 0 ] || { printf '%s\n' "$output"; return 1; }
+    [[ "$output" == "RC=124 SIZE=[]" ]]
+}

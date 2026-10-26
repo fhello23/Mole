@@ -28,8 +28,8 @@ clear_screen() { printf '\033[2J\033[H'; }
 hide_cursor() { [[ -t 1 ]] && printf '\033[?25l' >&2 || true; }
 show_cursor() { [[ -t 1 ]] && printf '\033[?25h' >&2 || true; }
 
-# Calculate display width (CJK characters count as 2)
-get_display_width() {
+# Calculate display width into MOLE_DISPLAY_WIDTH (CJK characters count as 2).
+get_display_width_value() {
     local str="$1"
 
     # Optimized pure bash implementation without forks
@@ -55,7 +55,7 @@ get_display_width() {
     fi
 
     if [[ $byte_count -eq $char_count ]]; then
-        echo "$char_count"
+        MOLE_DISPLAY_WIDTH=$char_count
         return
     fi
 
@@ -87,19 +87,24 @@ get_display_width() {
         width=$((width - zero_width))
     fi
 
-    echo "$width"
+    MOLE_DISPLAY_WIDTH=$width
 }
 
-# Truncate string by display width (handles CJK)
-truncate_by_display_width() {
+get_display_width() {
+    get_display_width_value "$1"
+    printf '%s\n' "$MOLE_DISPLAY_WIDTH"
+}
+
+# Truncate into MOLE_TRUNCATED_TEXT, preserving the established width heuristic.
+truncate_by_display_width_value() {
     local str="$1"
     local max_width="$2"
     local current_width
-    current_width=$(get_display_width "$str")
+    get_display_width_value "$str"
+    current_width=$MOLE_DISPLAY_WIDTH
 
     if [[ $current_width -le $max_width ]]; then
-        # printf, not echo: a string such as "-n" or "-e" is an echo option.
-        printf '%s\n' "$str"
+        MOLE_TRUNCATED_TEXT=$str
         return
     fi
 
@@ -161,7 +166,13 @@ truncate_by_display_width() {
         unset LC_ALL
     fi
 
-    printf '%s...\n' "$truncated"
+    MOLE_TRUNCATED_TEXT="$truncated..."
+}
+
+truncate_by_display_width() {
+    truncate_by_display_width_value "$1" "$2"
+    # A string such as "-n" or "-e" is an echo option.
+    printf '%s\n' "$MOLE_TRUNCATED_TEXT"
 }
 
 # Read single keyboard input
@@ -527,41 +538,46 @@ mo_load_spinner_frames() {
 }
 
 # Format relative time for compact display (e.g., 3d ago)
-format_last_used_summary() {
+format_last_used_summary_value() {
     local value="$1"
 
     case "$value" in
         "" | "Unknown")
-            echo "Unknown"
+            MOLE_LAST_USED_SUMMARY="Unknown"
             return 0
             ;;
         "Never" | "Recent" | "Today" | "Yesterday" | "This year" | "Old")
-            echo "$value"
+            MOLE_LAST_USED_SUMMARY="$value"
             return 0
             ;;
     esac
 
     if [[ $value =~ ^([0-9]+)[[:space:]]+days?\ ago$ ]]; then
-        echo "${BASH_REMATCH[1]}d ago"
+        MOLE_LAST_USED_SUMMARY="${BASH_REMATCH[1]}d ago"
         return 0
     fi
     if [[ $value =~ ^([0-9]+)[[:space:]]+weeks?\ ago$ ]]; then
-        echo "${BASH_REMATCH[1]}w ago"
+        MOLE_LAST_USED_SUMMARY="${BASH_REMATCH[1]}w ago"
         return 0
     fi
     if [[ $value =~ ^([0-9]+)[[:space:]]+months?\ ago$ ]]; then
-        echo "${BASH_REMATCH[1]}m ago"
+        MOLE_LAST_USED_SUMMARY="${BASH_REMATCH[1]}m ago"
         return 0
     fi
     if [[ $value =~ ^([0-9]+)[[:space:]]+month\(s\)\ ago$ ]]; then
-        echo "${BASH_REMATCH[1]}m ago"
+        MOLE_LAST_USED_SUMMARY="${BASH_REMATCH[1]}m ago"
         return 0
     fi
     if [[ $value =~ ^([0-9]+)[[:space:]]+years?\ ago$ ]]; then
-        echo "${BASH_REMATCH[1]}y ago"
+        MOLE_LAST_USED_SUMMARY="${BASH_REMATCH[1]}y ago"
         return 0
     fi
-    echo "$value"
+    MOLE_LAST_USED_SUMMARY="$value"
+}
+
+format_last_used_summary() {
+    format_last_used_summary_value "$1"
+    echo "$MOLE_LAST_USED_SUMMARY"
 }
 
 # Check if terminal has Full Disk Access

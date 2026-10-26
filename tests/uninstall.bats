@@ -4733,15 +4733,15 @@ set -euo pipefail
 
 trace_file="$HOME/selector-drain-trace.log"
 
+source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/ui/app_selector.sh"
 
 apps_data=("1700000000|$HOME/Applications/TraceApp.app|TraceApp|com.example.TraceApp|1MB|Today|1024")
 selected_apps=()
 
-get_display_width() { printf '%s\n' "${#1}"; }
-format_app_display() {
+format_app_display_value() {
     printf 'format\n' >> "$trace_file"
-    printf '%s' "$1"
+    MOLE_APP_DISPLAY=$1
 }
 drain_pending_input() { printf 'drain\n' >> "$trace_file"; }
 paginated_multi_select() {

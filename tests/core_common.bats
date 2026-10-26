@@ -1525,3 +1525,33 @@ printf '%s:%s\n' \"\$rc\" \"\$MOLE_HAS_FDA\"
 
     [ "$output" = "2:unknown" ]
 }
+
+@test "app selector formatting matches the pre-refactor byte snapshot" {
+    run /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/ui/app_selector.sh"
+source "$PROJECT_ROOT/tests/helpers/app_display.bash"
+render_app_display_fixtures > "$HOME/app-display-actual"
+cmp "$PROJECT_ROOT/tests/fixtures/app_display_expected.txt" "$HOME/app-display-actual"
+SCRIPT
+    [ "$status" -eq 0 ] || { printf '%s\n' "$output"; return 1; }
+}
+
+@test "terminal-safe global rendering matches the byte filter for every non-NUL byte" {
+    run /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+for ((i=1; i<256; i++)); do
+    printf -v octal '\\%03o' "$i"
+    printf -v byte '%b' "$octal"
+    value="before${byte}after"
+    expected=$(printf '%s' "$value" | LC_ALL=C tr '\r\n\t' '   ' | LC_ALL=C tr '\001-\010\013\014\016-\037\177' '?')
+    mole_terminal_safe_text_value "$value"
+    [[ "$MOLE_TERMINAL_SAFE_TEXT" == "$expected" ]] || { printf 'byte mismatch %s\n' "$i"; exit 1; }
+done
+printf 'all-bytes-equivalent\n'
+SCRIPT
+    [ "$status" -eq 0 ] || { printf '%s\n' "$output"; return 1; }
+    [[ "$output" == "all-bytes-equivalent" ]]
+}

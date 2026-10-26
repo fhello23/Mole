@@ -59,15 +59,19 @@ uninstall_normalize_size_display() {
     local app_path="${2:-}"
 
     if [[ -n "$app_path" ]] && uninstall_app_is_steam_launcher "$app_path"; then
-        echo "N/A (Steam-managed)"
-        return 0
+        size="N/A (Steam-managed)"
+    elif [[ -z "$size" || "$size" == "0" || "$size" == "Unknown" ]]; then
+        size="N/A"
     fi
-
-    if [[ -z "$size" || "$size" == "0" || "$size" == "Unknown" ]]; then
-        echo "N/A"
-        return 0
+    if [[ -n "${3:-}" ]]; then
+        # The selector supplies its local output variable to avoid a row fork.
+        # Match the previous $(echo ...) handling of options/trailing newlines.
+        [[ ! "$size" =~ ^-[eEn]+$ ]] || size=""
+        while [[ "$size" == *$'\n' ]]; do size=${size%$'\n'}; done
+        printf -v "$3" '%s' "$size"
+    else
+        echo "$size"
     fi
-    echo "$size"
 }
 
 uninstall_normalize_last_used_display() {

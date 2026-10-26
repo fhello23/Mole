@@ -262,6 +262,24 @@ find_app_system_files() { :; }
 discover_login_item_helper_bundle_ids() { :; }
 has_sensitive_data() { return 1; }
 get_path_size_kb() { printf '%s\n' "$1" >> "$HOME/measured"; printf '10\n'; }
+get_paths_size_kb() {
+    MOLE_PATH_SIZES_KB=()
+    MOLE_PATH_SIZE_STATUSES=()
+    [[ $# -ge 2 ]] || return 1
+    local size_timeout="$1" size_mode="$2" path size rc
+    local -a sizes=() statuses=()
+    shift 2
+    for path in "$@"; do
+        rc=0
+        size=$(get_path_size_kb "$path" "$size_timeout" "$size_mode") || rc=$?
+        mole_rc_timeout_or_signal "$rc" && return "$rc"
+        [[ $rc -eq 0 && "$size" =~ ^[0-9]+$ ]] || size=0
+        sizes+=("$size")
+        statuses+=("$rc")
+    done
+    MOLE_PATH_SIZES_KB=("${sizes[@]+"${sizes[@]}"}")
+    MOLE_PATH_SIZE_STATUSES=("${statuses[@]+"${statuses[@]}"}")
+}
 drain_pending_input() { :; }
 selected_apps=("0|$app|Example|com.example.app|0|Never")
 running_apps=() sudo_apps=() brew_cask_apps=() blocked_apps=() manual_removal_apps=() app_details=() leftover_notes=()
